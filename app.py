@@ -3,6 +3,7 @@ import json
 import os
 import re
 import shutil
+import ssl
 import subprocess
 import sys
 import tempfile
@@ -11,6 +12,11 @@ from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qs, urlparse
 from urllib.request import Request, urlopen
+
+try:
+    import certifi
+except ImportError:
+    certifi = None
 
 from yt_dlp import YoutubeDL
 from yt_dlp.utils import DownloadError, download_range_func
@@ -36,7 +42,7 @@ from PySide6.QtWidgets import (
 
 
 APP_TITLE = "MerchTools - Video Downloader"
-APP_VERSION = "1.0.3"
+APP_VERSION = "1.0.4"
 DEFAULT_OUTPUT_DIR = Path.home() / "Documents" / "MerchTools" / "Video Downloader"
 UPDATE_CONFIG_FILENAME = "update_config.json"
 SETTINGS_FILENAME = "user_settings.json"
@@ -189,6 +195,12 @@ def save_user_settings(data: dict) -> None:
     path = settings_path()
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+
+
+def urlopen_options() -> dict:
+    if certifi is None:
+        return {}
+    return {"context": ssl.create_default_context(cafile=certifi.where())}
 
 
 def subprocess_window_options() -> dict:
@@ -604,7 +616,7 @@ class UpdateCheckWorker(BaseWorker):
         )
 
         try:
-            with urlopen(request, timeout=20) as response:
+            with urlopen(request, timeout=20, **urlopen_options()) as response:
                 payload = response.read().decode("utf-8", errors="replace")
         except HTTPError as error:
             self.emit_error(f"Update check failed with HTTP {error.code}.")
@@ -665,7 +677,7 @@ class InstallerDownloadWorker(BaseWorker):
         )
 
         try:
-            with urlopen(request, timeout=30) as response:
+            with urlopen(request, timeout=30, **urlopen_options()) as response:
                 total_bytes = int(response.headers.get("Content-Length") or 0)
                 update_dir = Path(tempfile.gettempdir()) / "MerchTools Video Downloader Updates"
                 update_dir.mkdir(parents=True, exist_ok=True)
@@ -690,7 +702,10 @@ class InstallerDownloadWorker(BaseWorker):
             self.emit_error(f"Installer download failed with HTTP {error.code}.")
             return
         except URLError as error:
-            self.emit_error(f"Installer download failed: {error.reason}")
+            self.emit_error(
+                f"Installer download failed: {error.reason}\n\n"
+                f"If this machine has SSL certificate issues, open this link manually:\n{self.installer_url}"
+            )
             return
         except Exception as error:  # noqa: BLE001
             self.emit_error(f"Installer download failed: {error}")
@@ -1473,6 +1488,22 @@ class MainWindow(QMainWindow):
             return
 
         title = "Update download failed." if during_download else "Update check failed."
+        if during_download and self.update_info and "open this link manually:" in message.lower():
+            installer_url = str(self.update_info.get("installer_url", "")).strip()
+            answer = QMessageBox.question(
+                self,
+                APP_TITLE,
+                f"{title}\n\n{message}\n\nOpen the installer link in your browser instead?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.Yes,
+            )
+            if answer == QMessageBox.StandardButton.Yes and installer_url:
+                try:
+                    os.startfile(installer_url)
+                except OSError:
+                    pass
+            return
+
         self.show_error(f"{title}\n\n{message}")
 
     def launch_update_installer(self, installer_path: str) -> None:
