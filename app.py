@@ -34,7 +34,7 @@ from PySide6.QtWidgets import (
 
 
 APP_TITLE = "MerchTools - Video Downloader"
-APP_VERSION = "1.0.1"
+APP_VERSION = "1.0.2"
 DEFAULT_OUTPUT_DIR = Path.home() / "Documents" / "MerchTools" / "Video Downloader"
 UPDATE_CONFIG_FILENAME = "update_config.json"
 SETTINGS_FILENAME = "user_settings.json"
@@ -187,6 +187,18 @@ def save_user_settings(data: dict) -> None:
     path = settings_path()
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+
+
+def subprocess_window_options() -> dict:
+    if os.name != "nt":
+        return {}
+
+    startupinfo = subprocess.STARTUPINFO()
+    startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+    return {
+        "creationflags": subprocess.CREATE_NO_WINDOW,
+        "startupinfo": startupinfo,
+    }
 
 
 def version_key(value: str) -> tuple[int, ...]:
@@ -344,6 +356,7 @@ class DependencyWorker(BaseWorker):
                 text=True,
                 encoding="utf-8",
                 errors="replace",
+                **subprocess_window_options(),
             )
             if result.stdout.strip():
                 self.log(result.stdout.strip())
@@ -359,6 +372,7 @@ class DependencyWorker(BaseWorker):
             text=True,
             encoding="utf-8",
             errors="replace",
+            **subprocess_window_options(),
         )
 
         assert process.stdout is not None
@@ -438,6 +452,7 @@ class InfoWorker(BaseWorker):
                     text=True,
                     encoding="utf-8",
                     errors="replace",
+                    **subprocess_window_options(),
                 )
                 full_output: list[str] = []
                 assert process.stdout is not None
@@ -524,6 +539,7 @@ class DownloadWorker(BaseWorker):
                 text=True,
                 encoding="utf-8",
                 errors="replace",
+                **subprocess_window_options(),
             )
             self.process = process
 
@@ -1484,7 +1500,7 @@ class MainWindow(QMainWindow):
         output_dir = Path(self.output_dir_input.text().strip() or DEFAULT_OUTPUT_DIR)
         if not output_dir.exists():
             return
-        subprocess.Popen(["explorer.exe", str(output_dir)])
+        subprocess.Popen(["explorer.exe", str(output_dir)], **subprocess_window_options())
 
     def start_dependency_check(self) -> None:
         self.append_log("Looking for yt-dlp and ffmpeg...")

@@ -1,5 +1,5 @@
 {
-  "version": "1.0.2",
+  "version": "1.0.3",
   "installer_url": "https://example.com/MerchToolsVideoDownloaderSetup.exe",
   "filename": "MerchToolsVideoDownloaderSetup.exe",
   "notes": "Fixed installer launch issues and improved package size."
