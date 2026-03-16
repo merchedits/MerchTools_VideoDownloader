@@ -22,6 +22,7 @@ This version uses `PySide6` for a more modern desktop UI.
 
 ## Notes
 
+- The whole app is built using ChatGPT 5.4 and Codex for personal use only.
 - The app uses `yt-dlp --download-sections` to cut the clip you want.
 - Use the `Download full video` toggle if you want the entire source instead of a clipped range.
 - If `ffmpeg` is not installed system-wide, the app falls back to `imageio-ffmpeg` and uses its downloaded binary automatically.
