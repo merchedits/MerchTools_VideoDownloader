@@ -9,7 +9,6 @@ AppId={{4A4B5B6E-DB5D-4FDF-A337-6BB269AB2DF2}
 AppName={#MyAppName}
 AppVersion={#MyAppVersion}
 AppPublisher={#MyAppPublisher}
-SetupIconFile=assets\app-icon.ico
 UninstallDisplayIcon={app}\{#MyAppExeName}
 DefaultDirName={autopf}\{#MyAppName}
 DefaultGroupName={#MyAppName}
