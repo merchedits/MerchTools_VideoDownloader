@@ -1,5 +1,5 @@
 #define MyAppName "MerchTools - Video Downloader"
-#define MyAppVersion "1.0.2"
+#define MyAppVersion "1.0.3"
 #define MyAppPublisher "MerchEdits"
 #define MyAppExeName "MerchTools - Video Downloader.exe"
 #define MyAppSourceDir "dist\MerchTools - Video Downloader"

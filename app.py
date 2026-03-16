@@ -12,6 +12,8 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qs, urlparse
 from urllib.request import Request, urlopen
 
+from yt_dlp import YoutubeDL
+from yt_dlp.utils import DownloadError, download_range_func
 from PySide6.QtCore import QObject, QThread, Qt, Signal, QTimer
 from PySide6.QtGui import QColor, QFont, QIcon, QPainter, QPen
 from PySide6.QtWidgets import (
@@ -34,7 +36,7 @@ from PySide6.QtWidgets import (
 
 
 APP_TITLE = "MerchTools - Video Downloader"
-APP_VERSION = "1.0.2"
+APP_VERSION = "1.0.3"
 DEFAULT_OUTPUT_DIR = Path.home() / "Documents" / "MerchTools" / "Video Downloader"
 UPDATE_CONFIG_FILENAME = "update_config.json"
 SETTINGS_FILENAME = "user_settings.json"
@@ -233,6 +235,27 @@ class BaseWorker(QObject):
         self.signals.error.emit(message)
 
 
+class YtDlpWorkerLogger:
+    def __init__(self, worker: BaseWorker) -> None:
+        self.worker = worker
+
+    def debug(self, message: str) -> None:
+        if message and not message.startswith("[debug] "):
+            self.worker.log(message)
+
+    def info(self, message: str) -> None:
+        if message:
+            self.worker.log(message)
+
+    def warning(self, message: str) -> None:
+        if message:
+            self.worker.log(message)
+
+    def error(self, message: str) -> None:
+        if message:
+            self.worker.log(message)
+
+
 class ProgressButton(QPushButton):
     def __init__(self, text: str, parent: QWidget | None = None) -> None:
         super().__init__(text, parent)
@@ -418,112 +441,75 @@ class DependencyWorker(BaseWorker):
 
 
 class InfoWorker(BaseWorker):
-    def __init__(self, command: list[str], url: str) -> None:
+    def __init__(self, url: str) -> None:
         super().__init__()
-        self.command = command
         self.url = url
 
     def run(self) -> None:
         self.set_status("Fetching video info...")
         self.log(f"Fetching info for: {self.url}")
-        args = self.command + [
-            "--dump-single-json",
-            "--no-warnings",
-            "--skip-download",
-            "--no-playlist",
-            "--force-ipv4",
-            "--socket-timeout",
-            "30",
-            "--retries",
-            "10",
-            "--extractor-retries",
-            "5",
-            "--fragment-retries",
-            "10",
-            self.url,
-        ]
 
         for attempt in range(1, 4):
             try:
-                process = subprocess.Popen(
-                    args,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.STDOUT,
-                    text=True,
-                    encoding="utf-8",
-                    errors="replace",
-                    **subprocess_window_options(),
-                )
-                full_output: list[str] = []
-                assert process.stdout is not None
-                for line in process.stdout:
-                    clean_line = line.rstrip()
-                    if clean_line:
-                        full_output.append(clean_line)
-                        if not self.looks_like_json_payload(clean_line):
-                            self.log(clean_line)
-
-                exit_code = process.wait()
-                if exit_code != 0:
-                    stderr = full_output[-1] if full_output else "yt-dlp could not load the video."
-                    if "WinError 10054" in stderr and "twitch" in self.url.lower() and attempt < 3:
-                        self.log(f"Twitch metadata request dropped. Retrying ({attempt}/2)...")
-                        time.sleep(1.5 * attempt)
-                        continue
-                    self.emit_error(stderr)
-                    return
-
-                data = self.parse_json_output(full_output)
+                options = {
+                    "quiet": True,
+                    "no_warnings": True,
+                    "noplaylist": True,
+                    "forceipv4": True,
+                    "socket_timeout": 30,
+                    "retries": 10,
+                    "extractor_retries": 5,
+                    "fragment_retries": 10,
+                    "logger": YtDlpWorkerLogger(self),
+                }
+                with YoutubeDL(options) as ydl:
+                    data = ydl.extract_info(self.url, download=False)
                 self.signals.finished.emit(data)
                 return
-            except json.JSONDecodeError:
-                message = "yt-dlp returned invalid metadata."
-                self.log(message)
+            except DownloadError as error:
+                message = str(error).strip() or "yt-dlp could not load the video."
+                if "WinError 10054" in message and "twitch" in self.url.lower() and attempt < 3:
+                    self.log(f"Twitch metadata request dropped. Retrying ({attempt}/2)...")
+                    time.sleep(1.5 * attempt)
+                    continue
                 self.emit_error(message)
                 return
             except Exception as error:  # noqa: BLE001
                 self.emit_error(str(error))
                 return
 
-    def parse_json_output(self, lines: list[str]) -> dict:
-        for line in reversed(lines):
-            candidate = line.strip()
-            if not candidate:
-                continue
-            try:
-                loaded = json.loads(candidate)
-            except json.JSONDecodeError:
-                continue
-            if isinstance(loaded, dict):
-                return loaded
-        raise json.JSONDecodeError("No JSON object found in output.", "", 0)
-
-    def looks_like_json_payload(self, line: str) -> bool:
-        candidate = line.lstrip()
-        return candidate.startswith("{") and '"_type"' in candidate
-
 
 class DownloadWorker(BaseWorker):
-    def __init__(self, args: list[str], expected_duration: int | None = None) -> None:
+    def __init__(
+        self,
+        url: str,
+        output_template: str,
+        ffmpeg_path: str,
+        expected_duration: int | None = None,
+        start_seconds: int | None = None,
+        end_seconds: int | None = None,
+    ) -> None:
         super().__init__()
-        self.args = args
+        self.url = url
+        self.output_template = output_template
+        self.ffmpeg_path = ffmpeg_path
         self.expected_duration = expected_duration
-        self.progress_pattern = re.compile(r"\[download\]\s+(\d+(?:\.\d+)?)%")
-        self.ffmpeg_time_pattern = re.compile(r"time=(\d{2}:\d{2}:\d{2}(?:\.\d+)?)")
+        self.start_seconds = start_seconds
+        self.end_seconds = end_seconds
         self.cancel_requested = False
-        self.process: subprocess.Popen | None = None
+        self.ydl: YoutubeDL | None = None
 
     def cancel(self) -> None:
         self.cancel_requested = True
-        process = self.process
-        if process and process.poll() is None:
-            process.terminate()
+        ydl = self.ydl
+        if ydl is not None:
+            ydl._download_retcode = 1
 
     def run(self) -> None:
         self.set_status("Downloading...")
         self.signals.progress.emit(0)
         self.log("Starting download...")
-        self.log(" ".join(f'"{arg}"' if " " in arg else arg for arg in self.args))
+        self.log(f"Downloading URL: {self.url}")
 
         last_error = "Download failed. Check the activity log for details."
         for attempt in range(1, 4):
@@ -532,58 +518,72 @@ class DownloadWorker(BaseWorker):
                 self.signals.finished.emit({"cancelled": True})
                 return
 
-            process = subprocess.Popen(
-                self.args,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                **subprocess_window_options(),
-            )
-            self.process = process
+            try:
+                options = {
+                    "quiet": True,
+                    "noplaylist": True,
+                    "forceipv4": True,
+                    "socket_timeout": 30,
+                    "retries": 10,
+                    "extractor_retries": 5,
+                    "fragment_retries": 10,
+                    "format": "bestvideo*+bestaudio/best",
+                    "merge_output_format": "mp4",
+                    "ffmpeg_location": self.ffmpeg_path,
+                    "outtmpl": self.output_template,
+                    "force_keyframes_at_cuts": self.start_seconds is not None and self.end_seconds is not None,
+                    "progress_hooks": [self.on_progress],
+                    "logger": YtDlpWorkerLogger(self),
+                }
+                if self.start_seconds is not None and self.end_seconds is not None:
+                    options["download_ranges"] = download_range_func(None, [(self.start_seconds, self.end_seconds)])
 
-            full_output: list[str] = []
-            assert process.stdout is not None
-            for line in process.stdout:
-                if self.cancel_requested and process.poll() is None:
-                    process.terminate()
-                clean_line = line.rstrip()
-                if clean_line:
-                    full_output.append(clean_line)
-                    self.log(clean_line)
-                    match = self.progress_pattern.search(clean_line)
-                    if match:
-                        percentage = int(float(match.group(1)))
-                        self.signals.progress.emit(max(0, min(100, percentage)))
-                        continue
-                    ffmpeg_match = self.ffmpeg_time_pattern.search(clean_line)
-                    if ffmpeg_match and self.expected_duration:
-                        current_seconds = parse_clock_value(ffmpeg_match.group(1))
-                        percentage = int((current_seconds / self.expected_duration) * 100)
-                        self.signals.progress.emit(max(0, min(100, percentage)))
+                with YoutubeDL(options) as ydl:
+                    self.ydl = ydl
+                    code = ydl.download([self.url])
+                self.ydl = None
+                if self.cancel_requested:
+                    self.log("Download cancelled.")
+                    self.signals.finished.emit({"cancelled": True})
+                    return
+                if code == 0:
+                    self.log("Download finished.")
+                    self.signals.progress.emit(100)
+                    self.signals.finished.emit({"ok": True})
+                    return
+                last_error = f"Download failed with exit code {code}."
+                self.log(last_error)
+            except DownloadError as error:
+                last_error = str(error).strip() or "Download failed."
+            except Exception as error:  # noqa: BLE001
+                last_error = str(error).strip() or "Download failed."
 
-            exit_code = process.wait()
-            self.process = None
-            if self.cancel_requested:
-                self.log("Download cancelled.")
-                self.signals.finished.emit({"cancelled": True})
-                return
-            if exit_code == 0:
-                self.log("Download finished.")
-                self.signals.progress.emit(100)
-                self.signals.finished.emit({"ok": True})
-                return
-
-            last_error = full_output[-1] if full_output else f"Download failed with exit code {exit_code}."
-            self.log(f"Download failed with exit code {exit_code}.")
-            if "WinError 10054" in last_error and any("twitch" in arg.lower() for arg in self.args) and attempt < 3:
+            self.log(last_error)
+            if "WinError 10054" in last_error and "twitch" in self.url.lower() and attempt < 3:
                 self.log(f"Twitch request dropped. Retrying download ({attempt}/2)...")
                 self.signals.progress.emit(0)
                 time.sleep(1.5 * attempt)
                 continue
             self.emit_error(last_error)
             return
+
+    def on_progress(self, data: dict) -> None:
+        if self.cancel_requested:
+            raise DownloadError("Download cancelled by user.")
+
+        status = data.get("status")
+        if status == "finished":
+            self.signals.progress.emit(100)
+            return
+
+        if status != "downloading":
+            return
+
+        total_bytes = data.get("total_bytes") or data.get("total_bytes_estimate")
+        downloaded_bytes = data.get("downloaded_bytes")
+        if total_bytes and downloaded_bytes is not None:
+            percentage = int((downloaded_bytes / total_bytes) * 100)
+            self.signals.progress.emit(max(0, min(100, percentage)))
 
 
 class UpdateCheckWorker(BaseWorker):
@@ -1128,17 +1128,15 @@ class MainWindow(QMainWindow):
         if not url:
             return
 
-        command = self.resolve_yt_dlp_command()
-        if not command:
-            self.append_log("yt-dlp command could not be resolved.")
+        if not self.python_has_yt_dlp():
+            self.append_log("yt-dlp module is not available.")
             return
 
         self.is_fetching_info = True
         self.set_status("Fetching video info...")
         self.update_button_state()
-        self.append_log(f"Using yt-dlp command: {' '.join(command)}")
         self.append_log("Starting metadata lookup...")
-        worker = InfoWorker(command, url)
+        worker = InfoWorker(url)
         self.run_worker(
             worker,
             self.on_info_loaded,
@@ -1180,33 +1178,19 @@ class MainWindow(QMainWindow):
         start_text = self.start_input.text().strip()
         end_text = self.end_input.text().strip()
         ffmpeg_path = self.resolve_ffmpeg_executable()
-        command = self.resolve_yt_dlp_command(require_ffmpeg=True)
-        if not command or not ffmpeg_path:
+        if not self.python_has_yt_dlp():
+            self.show_error("yt-dlp is not available inside the app bundle.")
+            return
+        if not ffmpeg_path:
+            self.show_error(
+                "ffmpeg could not be prepared automatically.\n\n"
+                "This app needs ffmpeg to merge the best video+audio and cut exact sections."
+            )
             return
 
-        args = command + [
-            "--no-playlist",
-            "--newline",
-            "--force-ipv4",
-            "--socket-timeout",
-            "30",
-            "--retries",
-            "10",
-            "--extractor-retries",
-            "5",
-            "--fragment-retries",
-            "10",
-            "--format",
-            "bestvideo*+bestaudio/best",
-            "--merge-output-format",
-            "mp4",
-            "--ffmpeg-location",
-            ffmpeg_path,
-            "--output",
-            self.build_output_template(output_dir),
-        ]
-
         expected_duration: int | None = self.video_duration
+        start_seconds: int | None = None
+        end_seconds: int | None = None
         if not self.full_video_checkbox.isChecked():
             if not start_text or not end_text:
                 self.show_error('Enter both start and end times, or enable "Download full video".')
@@ -1229,18 +1213,22 @@ class MainWindow(QMainWindow):
 
             section_value = f"*{format_seconds(start_seconds)}-{format_seconds(end_seconds)}"
             expected_duration = end_seconds - start_seconds
-            args.extend(["--download-sections", section_value, "--force-keyframes-at-cuts"])
         else:
             self.append_log("Full video mode enabled.")
-
-        args.append(url)
 
         self.is_downloading = True
         self.set_progress(0)
         self.set_status("Downloading...")
         self.update_button_state()
         self.append_log("Starting download worker...")
-        worker = DownloadWorker(args, expected_duration=expected_duration)
+        worker = DownloadWorker(
+            url=url,
+            output_template=self.build_output_template(output_dir),
+            ffmpeg_path=ffmpeg_path,
+            expected_duration=expected_duration,
+            start_seconds=start_seconds,
+            end_seconds=end_seconds,
+        )
         self.run_worker(
             worker,
             self.on_download_finished,
@@ -1500,7 +1488,7 @@ class MainWindow(QMainWindow):
         output_dir = Path(self.output_dir_input.text().strip() or DEFAULT_OUTPUT_DIR)
         if not output_dir.exists():
             return
-        subprocess.Popen(["explorer.exe", str(output_dir)], **subprocess_window_options())
+        os.startfile(str(output_dir))
 
     def start_dependency_check(self) -> None:
         self.append_log("Looking for yt-dlp and ffmpeg...")

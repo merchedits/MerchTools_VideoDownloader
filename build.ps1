@@ -8,7 +8,6 @@ $BuildDir = Join-Path $ProjectRoot "build"
 $BuildTempDir = Join-Path $env:USERPROFILE "MerchToolsBuildTemp"
 $FfmpegSource = $env:YTCUTTER_FFMPEG_PATH
 $FfmpegTarget = Join-Path $ProjectRoot "ffmpeg.exe"
-$YtDlpTarget = Join-Path $ProjectRoot "yt-dlp.exe"
 
 New-Item -ItemType Directory -Force -Path $BuildTempDir | Out-Null
 $env:TMP = $BuildTempDir
@@ -16,28 +15,6 @@ $env:TEMP = $BuildTempDir
 
 & $PythonExe -m pip install --user --upgrade pip
 & $PythonExe -m pip install --user -r (Join-Path $ProjectRoot "build_requirements.txt")
-
-$YtDlpCandidates = @(
-    (& $PythonExe -c "import os, sysconfig; print(os.path.join(sysconfig.get_path('scripts'), 'yt-dlp.exe'))"),
-    (& $PythonExe -c "import os, site; print(os.path.join(site.USER_BASE, 'Python314', 'Scripts', 'yt-dlp.exe'))"),
-    (& $PythonExe -c "import os, site; print(os.path.join(site.USER_BASE, 'Scripts', 'yt-dlp.exe'))")
-) | Where-Object { $_ }
-
-$ResolvedYtDlp = $null
-foreach ($Candidate in $YtDlpCandidates) {
-    if (Test-Path $Candidate) {
-        $ResolvedYtDlp = $Candidate
-        break
-    }
-}
-
-if ($ResolvedYtDlp) {
-    Copy-Item $ResolvedYtDlp $YtDlpTarget -Force
-    Write-Host "Bundled yt-dlp executable: $ResolvedYtDlp"
-}
-else {
-    Write-Warning "Could not resolve yt-dlp.exe for bundling. The packaged app may not be able to launch yt-dlp correctly."
-}
 
 if ($FfmpegSource) {
     if (-not (Test-Path $FfmpegSource)) {
@@ -192,23 +169,12 @@ if (Test-Path $FfmpegTarget) {
     )
 }
 
-if (Test-Path $YtDlpTarget) {
-    $PyInstallerArgs += @(
-        "--add-binary"
-        "$YtDlpTarget;."
-    )
-}
-
 $PyInstallerArgs += (Join-Path $ProjectRoot "app.py")
 
 & $PythonExe -m PyInstaller @PyInstallerArgs
 
 if (Test-Path $FfmpegTarget) {
     Remove-Item $FfmpegTarget -Force
-}
-
-if (Test-Path $YtDlpTarget) {
-    Remove-Item $YtDlpTarget -Force
 }
 
 Write-Host ""
