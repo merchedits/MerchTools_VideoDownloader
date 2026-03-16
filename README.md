@@ -13,6 +13,7 @@ This version uses `PySide6` for a more modern desktop UI.
 - Shows a simple log so you can see what `yt-dlp` is doing
 - Checks on startup whether required tools are present and installs missing Python-based dependencies automatically
 - Accepts YouTube links, Twitch VODs, and Twitch clips
+- Can check a hosted update manifest and download a newer installer from inside the app
 
 ## Requirements
 
@@ -40,6 +41,8 @@ $env:YTCUTTER_FFMPEG_PATH="C:\path\to\ffmpeg.exe"
 
 That copies `ffmpeg.exe` into the packaged app so the recipient does not need a separate ffmpeg install.
 
+If you do not set `YTCUTTER_FFMPEG_PATH`, the build script will try to bundle ffmpeg automatically from `imageio-ffmpeg`.
+
 ### Build the Windows installer
 
 Install Inno Setup 6, then run:
@@ -49,6 +52,59 @@ Install Inno Setup 6, then run:
 ```
 
 That creates a standard Windows installer in `installer-dist`.
+
+## Installer Output
+
+The finished Windows installer is created as:
+
+```text
+installer-dist\MerchToolsVideoDownloaderSetup.exe
+```
+
+## App Updates
+
+The app now supports a simple installer-based update flow.
+
+How it works:
+
+- The app reads `update_config.json`
+- That file points to a hosted `latest.json` manifest
+- On startup or when `Check Updates` is clicked, the app compares the hosted version to its current version
+- If a newer version exists, it can download the new installer and launch it
+
+### 1. Configure the manifest URL
+
+Edit `update_config.json` before building:
+
+```json
+{
+  "manifest_url": "https://your-host.example.com/latest.json",
+  "check_on_startup": true
+}
+```
+
+### 2. Host a manifest file
+
+Use `latest.example.json` as the template:
+
+```json
+{
+  "version": "1.0.1",
+  "installer_url": "https://your-host.example.com/MerchToolsVideoDownloaderSetup.exe",
+  "filename": "MerchToolsVideoDownloaderSetup.exe",
+  "notes": "Fixed installer launch issues and improved package size."
+}
+```
+
+### 3. Upload the new installer
+
+Whenever you ship a new version:
+
+- build the new installer
+- upload `MerchToolsVideoDownloaderSetup.exe`
+- update the hosted `latest.json` with the new version and URL
+
+This works well with any static HTTPS host you control, including private-ish shared links or simple file hosting.
 
 ## Install
 
@@ -72,3 +128,6 @@ python app.py
 - When the app is packaged, it skips pip-based setup and prefers bundled dependencies.
 - Start and end time support `SS`, `MM:SS`, and `HH:MM:SS`.
 - If you leave the filename empty, the video title is used automatically.
+- The installer build bundles Python, yt-dlp, ffmpeg, and required Python dependencies.
+- Installed builds default to `Documents\MerchTools\Video Downloader` for each user instead of writing inside Program Files.
+- `update_config.json` is bundled into packaged builds, so set its `manifest_url` before making your release installer.

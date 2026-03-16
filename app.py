@@ -1,12 +1,16 @@
 import importlib
 import json
+import os
 import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
+from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qs, urlparse
+from urllib.request import Request, urlopen
 
 from PySide6.QtCore import QObject, QThread, Qt, Signal, QTimer
 from PySide6.QtGui import QColor, QFont, QPainter, QPen
@@ -30,7 +34,9 @@ from PySide6.QtWidgets import (
 
 
 APP_TITLE = "MerchTools - Video Downloader"
-DEFAULT_OUTPUT_DIR = Path.cwd() / "downloads"
+APP_VERSION = "1.0.0"
+DEFAULT_OUTPUT_DIR = Path.home() / "Documents" / "MerchTools" / "Video Downloader"
+UPDATE_CONFIG_FILENAME = "update_config.json"
 REQUIRED_PYTHON_PACKAGES = [
     ("yt_dlp", "yt-dlp"),
     ("imageio_ffmpeg", "imageio-ffmpeg"),
@@ -114,6 +120,54 @@ def normalize_video_url(raw_url: str) -> str:
         return f"https://clips.twitch.tv{path}" if path else text
 
     return text
+
+
+def application_dir() -> Path:
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parent
+
+
+def bundled_file_candidates(filename: str) -> list[Path]:
+    base_dir = application_dir()
+    return [
+        base_dir / filename,
+        base_dir / "_internal" / filename,
+        Path(__file__).resolve().parent / filename,
+    ]
+
+
+def load_json_file(filename: str) -> dict:
+    for candidate in bundled_file_candidates(filename):
+        if candidate.exists():
+            try:
+                return json.loads(candidate.read_text(encoding="utf-8"))
+            except json.JSONDecodeError as error:
+                raise RuntimeError(f"{filename} contains invalid JSON: {error}") from error
+    return {}
+
+
+def load_update_config() -> dict:
+    config = {
+        "manifest_url": "",
+        "check_on_startup": True,
+    }
+    try:
+        loaded = load_json_file(UPDATE_CONFIG_FILENAME)
+    except RuntimeError:
+        return config
+    if isinstance(loaded, dict):
+        config.update(loaded)
+    return config
+
+
+def version_key(value: str) -> tuple[int, ...]:
+    parts = [int(part) for part in re.findall(r"\d+", value)]
+    return tuple(parts or [0])
+
+
+def is_newer_version(current_version: str, candidate_version: str) -> bool:
+    return version_key(candidate_version) > version_key(current_version)
 
 
 class WorkerSignals(QObject):
@@ -399,6 +453,129 @@ class DownloadWorker(BaseWorker):
             return
 
 
+class UpdateCheckWorker(BaseWorker):
+    def __init__(self, manifest_url: str, current_version: str) -> None:
+        super().__init__()
+        self.manifest_url = manifest_url
+        self.current_version = current_version
+
+    def run(self) -> None:
+        self.log(f"Checking for updates: {self.manifest_url}")
+        self.set_status("Checking for updates...")
+        request = Request(
+            self.manifest_url,
+            headers={
+                "User-Agent": f"MerchToolsVideoDownloader/{self.current_version}",
+                "Accept": "application/json",
+            },
+        )
+
+        try:
+            with urlopen(request, timeout=20) as response:
+                payload = response.read().decode("utf-8", errors="replace")
+        except HTTPError as error:
+            self.emit_error(f"Update check failed with HTTP {error.code}.")
+            return
+        except URLError as error:
+            self.emit_error(f"Update check failed: {error.reason}")
+            return
+        except Exception as error:  # noqa: BLE001
+            self.emit_error(f"Update check failed: {error}")
+            return
+
+        try:
+            data = json.loads(payload)
+        except json.JSONDecodeError:
+            self.emit_error("Update manifest returned invalid JSON.")
+            return
+
+        if not isinstance(data, dict):
+            self.emit_error("Update manifest has an unexpected format.")
+            return
+
+        latest_version = str(data.get("version", "")).strip()
+        installer_url = str(data.get("installer_url") or data.get("url") or "").strip()
+        notes = str(data.get("notes", "")).strip()
+        filename = str(data.get("filename", "")).strip()
+
+        if not latest_version:
+            self.emit_error("Update manifest is missing a version value.")
+            return
+        if not installer_url:
+            self.emit_error("Update manifest is missing an installer_url value.")
+            return
+
+        result = {
+            "current_version": self.current_version,
+            "latest_version": latest_version,
+            "installer_url": installer_url,
+            "notes": notes,
+            "filename": filename,
+            "update_available": is_newer_version(self.current_version, latest_version),
+        }
+        self.signals.finished.emit(result)
+
+
+class InstallerDownloadWorker(BaseWorker):
+    def __init__(self, installer_url: str, version: str, filename: str = "") -> None:
+        super().__init__()
+        self.installer_url = installer_url
+        self.version = version
+        self.filename = filename
+
+    def run(self) -> None:
+        self.set_status("Downloading update...")
+        self.log(f"Downloading update installer: {self.installer_url}")
+        request = Request(
+            self.installer_url,
+            headers={"User-Agent": f"MerchToolsVideoDownloader/{APP_VERSION}"},
+        )
+
+        try:
+            with urlopen(request, timeout=30) as response:
+                total_bytes = int(response.headers.get("Content-Length") or 0)
+                update_dir = Path(tempfile.gettempdir()) / "MerchTools Video Downloader Updates"
+                update_dir.mkdir(parents=True, exist_ok=True)
+                filename = self.resolve_filename()
+                destination = update_dir / filename
+
+                downloaded = 0
+                last_logged_percent = -1
+                with destination.open("wb") as handle:
+                    while True:
+                        chunk = response.read(1024 * 256)
+                        if not chunk:
+                            break
+                        handle.write(chunk)
+                        downloaded += len(chunk)
+                        if total_bytes > 0:
+                            percent = int((downloaded / total_bytes) * 100)
+                            if percent >= last_logged_percent + 10 or percent == 100:
+                                last_logged_percent = percent
+                                self.log(f"Update download: {percent}%")
+        except HTTPError as error:
+            self.emit_error(f"Installer download failed with HTTP {error.code}.")
+            return
+        except URLError as error:
+            self.emit_error(f"Installer download failed: {error.reason}")
+            return
+        except Exception as error:  # noqa: BLE001
+            self.emit_error(f"Installer download failed: {error}")
+            return
+
+        self.signals.finished.emit({"installer_path": str(destination), "version": self.version})
+
+    def resolve_filename(self) -> str:
+        if self.filename:
+            name = Path(self.filename).name
+        else:
+            path_name = Path(urlparse(self.installer_url).path).name
+            name = path_name or f"MerchToolsVideoDownloaderSetup-{self.version}.exe"
+        if not name.lower().endswith(".exe"):
+            name = f"{name}.exe"
+        return name
+
+
 class CardFrame(QFrame):
     def __init__(self, title: str, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -428,12 +605,18 @@ class MainWindow(QMainWindow):
         self.dependencies_ready = False
         self.is_fetching_info = False
         self.is_downloading = False
+        self.is_checking_updates = False
+        self.is_installing_update = False
         self.video_duration: int | None = None
         self.video_title = ""
         self.last_auto_filename = ""
         self.ffmpeg_path: str | None = None
         self.active_thread: QThread | None = None
         self.active_worker: BaseWorker | None = None
+        self.update_thread: QThread | None = None
+        self.update_worker: BaseWorker | None = None
+        self.update_info: dict | None = None
+        self.update_config = load_update_config()
         self.last_fetched_url = ""
         self.last_output_path: Path | None = None
         self.url_fetch_timer = QTimer(self)
@@ -445,6 +628,8 @@ class MainWindow(QMainWindow):
         self.setStyleSheet(self.build_stylesheet())
         self.build_ui()
         self.update_button_state()
+        self.refresh_update_button()
+        self.append_log(f"App version: {APP_VERSION}")
         self.append_log("Ready. Paste a YouTube or Twitch link, choose full video or enter a clip range, then download.")
         self.start_dependency_check()
 
@@ -474,6 +659,15 @@ class MainWindow(QMainWindow):
         title = QLabel("Video Downloader")
         title.setObjectName("heroTitle")
         brand_wrap.addWidget(title)
+
+        self.version_label = QLabel(f"v{APP_VERSION}")
+        self.version_label.setObjectName("versionPill")
+        top_row.addWidget(self.version_label)
+
+        self.check_updates_button = QPushButton("Check Updates")
+        self.check_updates_button.setObjectName("secondaryButton")
+        self.check_updates_button.clicked.connect(self.check_for_updates)
+        top_row.addWidget(self.check_updates_button)
         top_row.addStretch(1)
 
         content = QHBoxLayout()
@@ -596,6 +790,14 @@ class MainWindow(QMainWindow):
             font-size: 32px;
             font-weight: 700;
         }
+        QLabel#versionPill {
+            color: #cbbda8;
+            font-size: 12px;
+            font-weight: 700;
+            padding: 6px 10px;
+            border: 1px solid #2a2e33;
+            border-radius: 999px;
+        }
         QLabel#hintText, QLabel#metaText {
             color: #cbbda8;
             line-height: 1.4;
@@ -677,6 +879,9 @@ class MainWindow(QMainWindow):
             font-weight: 700;
             padding: 13px 18px;
         }
+        QPushButton#secondaryButton {
+            padding: 10px 14px;
+        }
         QPlainTextEdit#logOutput {
             font-family: Consolas, monospace;
             font-size: 13px;
@@ -698,6 +903,27 @@ class MainWindow(QMainWindow):
 
     def set_progress(self, value: int) -> None:
         self.download_button.set_progress_state(True, max(0, min(100, value)))
+
+    def refresh_update_button(self) -> None:
+        if not hasattr(self, "check_updates_button"):
+            return
+
+        if self.is_installing_update:
+            self.check_updates_button.setText("Downloading Update...")
+            self.check_updates_button.setDisabled(True)
+            return
+
+        if self.is_checking_updates:
+            self.check_updates_button.setText("Checking...")
+            self.check_updates_button.setDisabled(True)
+            return
+
+        if self.update_info and self.update_info.get("update_available"):
+            latest_version = self.update_info.get("latest_version", "")
+            self.check_updates_button.setText(f"Update v{latest_version}")
+        else:
+            self.check_updates_button.setText("Check Updates")
+        self.check_updates_button.setDisabled(False)
 
     def choose_folder(self) -> None:
         folder = QFileDialog.getExistingDirectory(self, "Choose Save Folder", self.output_dir_input.text())
@@ -848,6 +1074,7 @@ class MainWindow(QMainWindow):
             worker,
             self.on_download_finished,
             lambda message: self.on_worker_error(message, "Ready"),
+            progress_handler=self.set_progress,
         )
 
     def on_info_loaded(self, data: object) -> None:
@@ -888,6 +1115,61 @@ class MainWindow(QMainWindow):
             self.ffmpeg_path = result.get("ffmpeg_path")
         self.update_button_state()
         self.fetch_info_if_ready()
+        self.queue_startup_update_check()
+
+    def on_update_check_finished(self, result: object) -> None:
+        self.is_checking_updates = False
+        self.refresh_update_button()
+
+        if not isinstance(result, dict):
+            return
+
+        self.update_info = result
+        latest_version = result.get("latest_version", "")
+        if result.get("update_available"):
+            self.append_log(f"Update available: v{latest_version}")
+            self.refresh_update_button()
+            notes = str(result.get("notes", "")).strip()
+            body = f"Version {latest_version} is available. You are on {APP_VERSION}."
+            if notes:
+                body += f"\n\nWhat's new:\n{notes}"
+            body += "\n\nDownload and launch the installer now?"
+            answer = QMessageBox.question(
+                self,
+                APP_TITLE,
+                body,
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.Yes,
+            )
+            if answer == QMessageBox.StandardButton.Yes:
+                self.download_update_installer()
+            return
+
+        self.append_log("You already have the latest version.")
+
+    def on_update_download_finished(self, result: object) -> None:
+        self.is_installing_update = False
+        self.refresh_update_button()
+        if not isinstance(result, dict):
+            return
+
+        installer_path = str(result.get("installer_path", "")).strip()
+        version = str(result.get("version", "")).strip()
+        if not installer_path:
+            return
+
+        self.append_log(f"Update installer downloaded: {installer_path}")
+        answer = QMessageBox.question(
+            self,
+            APP_TITLE,
+            f"Update v{version} is ready.\n\nLaunch the installer now? The app will close right after it starts.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.Yes,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+
+        self.launch_update_installer(installer_path)
 
     def on_worker_error(self, message: str, status: str) -> None:
         self.is_fetching_info = False
@@ -899,6 +1181,10 @@ class MainWindow(QMainWindow):
     def on_thread_finished(self) -> None:
         self.active_thread = None
         self.active_worker = None
+
+    def on_update_thread_finished(self) -> None:
+        self.update_thread = None
+        self.update_worker = None
 
     def show_error(self, message: str) -> None:
         QMessageBox.critical(self, APP_TITLE, message)
@@ -920,6 +1206,82 @@ class MainWindow(QMainWindow):
         )
         self.download_button.setDisabled(not can_download)
 
+    def update_configured(self) -> bool:
+        manifest_url = str(self.update_config.get("manifest_url", "")).strip()
+        return manifest_url.startswith("http://") or manifest_url.startswith("https://")
+
+    def queue_startup_update_check(self) -> None:
+        if self.update_config.get("check_on_startup", True):
+            QTimer.singleShot(1500, lambda: self.check_for_updates(silent=True))
+
+    def check_for_updates(self, silent: bool = False) -> None:
+        if self.is_checking_updates or self.is_installing_update:
+            return
+
+        if not self.update_configured():
+            if not silent:
+                config_paths = "\n".join(str(path) for path in bundled_file_candidates(UPDATE_CONFIG_FILENAME))
+                QMessageBox.information(
+                    self,
+                    APP_TITLE,
+                    "Updates are not configured yet.\n\n"
+                    "Set a manifest_url in update_config.json, then rebuild the installer.\n\n"
+                    f"App version: {APP_VERSION}\n\n"
+                    f"Searched these locations:\n{config_paths}",
+                )
+            return
+
+        if self.update_thread is not None:
+            return
+
+        self.is_checking_updates = True
+        self.refresh_update_button()
+        worker = UpdateCheckWorker(str(self.update_config.get("manifest_url", "")).strip(), APP_VERSION)
+        self.run_update_worker(
+            worker,
+            self.on_update_check_finished,
+            lambda message: self.on_update_error(message, silent=silent, during_download=False),
+        )
+
+    def download_update_installer(self) -> None:
+        if not self.update_info:
+            return
+
+        installer_url = str(self.update_info.get("installer_url", "")).strip()
+        latest_version = str(self.update_info.get("latest_version", "")).strip()
+        filename = str(self.update_info.get("filename", "")).strip()
+        if not installer_url or not latest_version:
+            return
+
+        self.is_installing_update = True
+        self.refresh_update_button()
+        worker = InstallerDownloadWorker(installer_url, latest_version, filename)
+        self.run_update_worker(
+            worker,
+            self.on_update_download_finished,
+            lambda message: self.on_update_error(message, silent=False, during_download=True),
+        )
+
+    def on_update_error(self, message: str, silent: bool, during_download: bool) -> None:
+        self.is_checking_updates = False
+        self.is_installing_update = False
+        self.refresh_update_button()
+        self.append_log(message)
+        if silent:
+            return
+
+        title = "Update download failed." if during_download else "Update check failed."
+        self.show_error(f"{title}\n\n{message}")
+
+    def launch_update_installer(self, installer_path: str) -> None:
+        try:
+            os.startfile(installer_path)
+        except OSError as error:
+            self.show_error(f"Could not launch the installer.\n\n{error}")
+            return
+
+        QTimer.singleShot(250, QApplication.instance().quit)
+
     def reveal_in_explorer(self) -> None:
         output_dir = Path(self.output_dir_input.text().strip() or DEFAULT_OUTPUT_DIR)
         if not output_dir.exists():
@@ -936,6 +1298,7 @@ class MainWindow(QMainWindow):
             self.append_log("Dependencies already available. No setup needed.")
             self.update_button_state()
             self.fetch_info_if_ready()
+            self.queue_startup_update_check()
             return
 
         self.update_button_state()
@@ -946,14 +1309,15 @@ class MainWindow(QMainWindow):
             lambda message: self.on_worker_error(message, "Setup failed"),
         )
 
-    def run_worker(self, worker: BaseWorker, success_handler, error_handler) -> None:
+    def run_worker(self, worker: BaseWorker, success_handler, error_handler, progress_handler=None) -> None:
         thread = QThread(self)
         worker.moveToThread(thread)
         self.active_thread = thread
         self.active_worker = worker
         worker.signals.log.connect(self.append_log)
         worker.signals.status.connect(self.set_status)
-        worker.signals.progress.connect(self.set_progress)
+        if progress_handler is not None:
+            worker.signals.progress.connect(progress_handler)
         worker.signals.finished.connect(success_handler)
         worker.signals.finished.connect(thread.quit)
         worker.signals.finished.connect(worker.deleteLater)
@@ -965,13 +1329,45 @@ class MainWindow(QMainWindow):
         thread.started.connect(worker.run)
         thread.start()
 
+    def run_update_worker(self, worker: BaseWorker, success_handler, error_handler) -> None:
+        thread = QThread(self)
+        worker.moveToThread(thread)
+        self.update_thread = thread
+        self.update_worker = worker
+        worker.signals.log.connect(self.append_log)
+        worker.signals.finished.connect(success_handler)
+        worker.signals.finished.connect(thread.quit)
+        worker.signals.finished.connect(worker.deleteLater)
+        worker.signals.error.connect(error_handler)
+        worker.signals.error.connect(thread.quit)
+        worker.signals.error.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        thread.finished.connect(self.on_update_thread_finished)
+        thread.started.connect(worker.run)
+        thread.start()
+
     def resolve_yt_dlp_command(self, require_ffmpeg: bool = False) -> list[str] | None:
         module_spec = shutil.which("yt-dlp")
-        if self.python_has_yt_dlp():
+        if self.is_frozen():
+            packaged_dir = Path(sys.executable).resolve().parent
+            candidates = [
+                packaged_dir / "yt-dlp.exe",
+                packaged_dir / "_internal" / "yt-dlp.exe",
+            ]
+            for candidate in candidates:
+                if candidate.exists():
+                    command = [str(candidate)]
+                    break
+            else:
+                command = None
+        elif self.python_has_yt_dlp():
             command = [sys.executable, "-m", "yt_dlp"]
         elif module_spec:
             command = [module_spec]
         else:
+            command = None
+
+        if not command:
             self.show_error(
                 "yt-dlp is not installed.\n\n"
                 "Run: pip install yt-dlp\n"
