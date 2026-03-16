@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.build-venv/
+build/
+dist/
+installer-dist/
+downloads/
+ffmpeg.exe
