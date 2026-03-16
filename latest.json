@@ -1,6 +1,6 @@
 {
-  "version": "1.0.3",
-  "installer_url": "https://github.com/merchedits/MerchTools_VideoDownloader/releases/download/v1.0.3/MerchToolsVideoDownloaderSetup.exe",
+  "version": "1.0.4",
+  "installer_url": "https://github.com/merchedits/MerchTools_VideoDownloader/releases/download/v1.0.4/MerchToolsVideoDownloaderSetup.exe",
   "filename": "MerchToolsVideoDownloaderSetup.exe",
-  "notes": "Fixed clean-machine installs by using bundled yt-dlp directly, restored Reveal in Explorer, and kept the no-console behavior."
+  "notes": "Fixed clean-machine yt-dlp packaging and added a safer updater fallback for SSL certificate issues."
 }
