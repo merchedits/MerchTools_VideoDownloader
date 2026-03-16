@@ -69,6 +69,8 @@ $PyInstallerArgs = @(
     "--noconfirm"
     "--clean"
     "--windowed"
+    "--icon"
+    (Join-Path $ProjectRoot "assets\app-icon.ico")
     "--name"
     $AppName
     "--hidden-import"
@@ -77,6 +79,8 @@ $PyInstallerArgs = @(
     "imageio_ffmpeg"
     "--add-data"
     "$ProjectRoot\README.md;."
+    "--add-data"
+    "$ProjectRoot\assets\app-icon.png;assets"
     "--add-data"
     "$ProjectRoot\update_config.json;."
     "--add-data"

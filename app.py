@@ -13,7 +13,7 @@ from urllib.parse import parse_qs, urlparse
 from urllib.request import Request, urlopen
 
 from PySide6.QtCore import QObject, QThread, Qt, Signal, QTimer
-from PySide6.QtGui import QColor, QFont, QPainter, QPen
+from PySide6.QtGui import QColor, QFont, QIcon, QPainter, QPen
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -34,9 +34,10 @@ from PySide6.QtWidgets import (
 
 
 APP_TITLE = "MerchTools - Video Downloader"
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.0.1"
 DEFAULT_OUTPUT_DIR = Path.home() / "Documents" / "MerchTools" / "Video Downloader"
 UPDATE_CONFIG_FILENAME = "update_config.json"
+SETTINGS_FILENAME = "user_settings.json"
 REQUIRED_PYTHON_PACKAGES = [
     ("yt_dlp", "yt-dlp"),
     ("imageio_ffmpeg", "imageio-ffmpeg"),
@@ -137,6 +138,17 @@ def bundled_file_candidates(filename: str) -> list[Path]:
     ]
 
 
+def user_data_dir() -> Path:
+    appdata = os.getenv("APPDATA")
+    if appdata:
+        return Path(appdata) / "MerchTools" / "Video Downloader"
+    return Path.home() / "AppData" / "Roaming" / "MerchTools" / "Video Downloader"
+
+
+def settings_path() -> Path:
+    return user_data_dir() / SETTINGS_FILENAME
+
+
 def load_json_file(filename: str) -> dict:
     for candidate in bundled_file_candidates(filename):
         if candidate.exists():
@@ -159,6 +171,22 @@ def load_update_config() -> dict:
     if isinstance(loaded, dict):
         config.update(loaded)
     return config
+
+
+def load_user_settings() -> dict:
+    path = settings_path()
+    if not path.exists():
+        return {}
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def save_user_settings(data: dict) -> None:
+    path = settings_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(data, indent=2), encoding="utf-8")
 
 
 def version_key(value: str) -> tuple[int, ...]:
@@ -198,11 +226,33 @@ class ProgressButton(QPushButton):
         super().__init__(text, parent)
         self._progress = 0
         self._show_progress = False
+        self._hover_cancel = False
+        self._hover_primary = False
+        self.setMouseTracking(True)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
 
     def set_progress_state(self, active: bool, value: int = 0) -> None:
         self._show_progress = active
         self._progress = max(0, min(100, value))
+        if not active:
+            self._hover_cancel = False
         self.update()
+
+    def enterEvent(self, event) -> None:  # type: ignore[override]
+        if self._show_progress:
+            self._hover_cancel = True
+        else:
+            self._hover_primary = True
+        self.update()
+        super().enterEvent(event)
+
+    def leaveEvent(self, event) -> None:  # type: ignore[override]
+        if self._hover_cancel:
+            self._hover_cancel = False
+        if self._hover_primary:
+            self._hover_primary = False
+        self.update()
+        super().leaveEvent(event)
 
     def paintEvent(self, event) -> None:  # type: ignore[override]
         painter = QPainter(self)
@@ -210,18 +260,30 @@ class ProgressButton(QPushButton):
 
         rect = self.rect().adjusted(0, 0, -1, -1)
         radius = 12
-        bg = QColor("#1b1f23") if self.isEnabled() else QColor("#171a1d")
-        border = QColor("#2a2e33") if self.isEnabled() else QColor("#22262a")
+        if self.isEnabled() and not self._show_progress:
+            bg = QColor("#ff9a55") if not self._hover_primary else QColor("#ffae73")
+            border = QColor("#ffb883") if self._hover_primary else QColor("#ff9a55")
+        else:
+            bg = QColor("#1b1f23") if self.isEnabled() else QColor("#171a1d")
+            border = QColor("#2a2e33") if self.isEnabled() else QColor("#22262a")
         text_color = QColor("#efe8dd") if self.isEnabled() else QColor("#7d766d")
+        progress_active = self._show_progress and not self._hover_cancel
 
         painter.setPen(QPen(border, 1))
         painter.setBrush(bg)
         painter.drawRoundedRect(rect, radius, radius)
 
-        if self._show_progress:
+        if self._show_progress and not self._hover_cancel:
+            text_color = QColor("#1a1613")
+        if self._hover_cancel and self._show_progress:
+            painter.setPen(QPen(QColor("#cb4b4b"), 1))
+            painter.setBrush(QColor("#7a2020"))
+            painter.drawRoundedRect(rect, radius, radius)
+            text_color = QColor("#fff2f2")
+        elif self._show_progress:
             border = QColor("#ff9a55")
             text_color = QColor("#efe8dd")
-        if self._show_progress and self._progress > 0:
+        if progress_active and self._progress > 0:
             painter.setPen(Qt.PenStyle.NoPen)
             painter.setBrush(QColor("#ff9a55"))
             painter.setClipRect(rect)
@@ -234,7 +296,9 @@ class ProgressButton(QPushButton):
 
         painter.setPen(text_color)
         text = self.text()
-        if self._show_progress:
+        if self._hover_cancel and self._show_progress:
+            text = "Cancel Download"
+        elif self._show_progress:
             text = f"Downloading... {self._progress}%"
         painter.drawText(rect, Qt.AlignmentFlag.AlignCenter, text)
 
@@ -350,6 +414,8 @@ class InfoWorker(BaseWorker):
         self.log(f"Fetching info for: {self.url}")
         args = self.command + [
             "--dump-single-json",
+            "--no-warnings",
+            "--skip-download",
             "--no-playlist",
             "--force-ipv4",
             "--socket-timeout",
@@ -365,31 +431,61 @@ class InfoWorker(BaseWorker):
 
         for attempt in range(1, 4):
             try:
-                result = subprocess.run(
+                process = subprocess.Popen(
                     args,
-                    capture_output=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
                     text=True,
-                    check=True,
                     encoding="utf-8",
                     errors="replace",
                 )
-                data = json.loads(result.stdout)
+                full_output: list[str] = []
+                assert process.stdout is not None
+                for line in process.stdout:
+                    clean_line = line.rstrip()
+                    if clean_line:
+                        full_output.append(clean_line)
+                        if not self.looks_like_json_payload(clean_line):
+                            self.log(clean_line)
+
+                exit_code = process.wait()
+                if exit_code != 0:
+                    stderr = full_output[-1] if full_output else "yt-dlp could not load the video."
+                    if "WinError 10054" in stderr and "twitch" in self.url.lower() and attempt < 3:
+                        self.log(f"Twitch metadata request dropped. Retrying ({attempt}/2)...")
+                        time.sleep(1.5 * attempt)
+                        continue
+                    self.emit_error(stderr)
+                    return
+
+                data = self.parse_json_output(full_output)
                 self.signals.finished.emit(data)
-                return
-            except subprocess.CalledProcessError as error:
-                stderr = error.stderr.strip() or "yt-dlp could not load the video."
-                self.log(stderr)
-                if "WinError 10054" in stderr and "twitch" in self.url.lower() and attempt < 3:
-                    self.log(f"Twitch metadata request dropped. Retrying ({attempt}/2)...")
-                    time.sleep(1.5 * attempt)
-                    continue
-                self.emit_error(stderr)
                 return
             except json.JSONDecodeError:
                 message = "yt-dlp returned invalid metadata."
                 self.log(message)
                 self.emit_error(message)
                 return
+            except Exception as error:  # noqa: BLE001
+                self.emit_error(str(error))
+                return
+
+    def parse_json_output(self, lines: list[str]) -> dict:
+        for line in reversed(lines):
+            candidate = line.strip()
+            if not candidate:
+                continue
+            try:
+                loaded = json.loads(candidate)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(loaded, dict):
+                return loaded
+        raise json.JSONDecodeError("No JSON object found in output.", "", 0)
+
+    def looks_like_json_payload(self, line: str) -> bool:
+        candidate = line.lstrip()
+        return candidate.startswith("{") and '"_type"' in candidate
 
 
 class DownloadWorker(BaseWorker):
@@ -399,6 +495,14 @@ class DownloadWorker(BaseWorker):
         self.expected_duration = expected_duration
         self.progress_pattern = re.compile(r"\[download\]\s+(\d+(?:\.\d+)?)%")
         self.ffmpeg_time_pattern = re.compile(r"time=(\d{2}:\d{2}:\d{2}(?:\.\d+)?)")
+        self.cancel_requested = False
+        self.process: subprocess.Popen | None = None
+
+    def cancel(self) -> None:
+        self.cancel_requested = True
+        process = self.process
+        if process and process.poll() is None:
+            process.terminate()
 
     def run(self) -> None:
         self.set_status("Downloading...")
@@ -408,6 +512,11 @@ class DownloadWorker(BaseWorker):
 
         last_error = "Download failed. Check the activity log for details."
         for attempt in range(1, 4):
+            if self.cancel_requested:
+                self.log("Download cancelled.")
+                self.signals.finished.emit({"cancelled": True})
+                return
+
             process = subprocess.Popen(
                 self.args,
                 stdout=subprocess.PIPE,
@@ -416,10 +525,13 @@ class DownloadWorker(BaseWorker):
                 encoding="utf-8",
                 errors="replace",
             )
+            self.process = process
 
             full_output: list[str] = []
             assert process.stdout is not None
             for line in process.stdout:
+                if self.cancel_requested and process.poll() is None:
+                    process.terminate()
                 clean_line = line.rstrip()
                 if clean_line:
                     full_output.append(clean_line)
@@ -436,6 +548,11 @@ class DownloadWorker(BaseWorker):
                         self.signals.progress.emit(max(0, min(100, percentage)))
 
             exit_code = process.wait()
+            self.process = None
+            if self.cancel_requested:
+                self.log("Download cancelled.")
+                self.signals.finished.emit({"cancelled": True})
+                return
             if exit_code == 0:
                 self.log("Download finished.")
                 self.signals.progress.emit(100)
@@ -599,6 +716,7 @@ class MainWindow(QMainWindow):
         self.setWindowTitle(APP_TITLE)
         self.resize(1120, 760)
         self.setMinimumSize(980, 760)
+        self.apply_window_icon()
 
         DEFAULT_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -617,6 +735,7 @@ class MainWindow(QMainWindow):
         self.update_worker: BaseWorker | None = None
         self.update_info: dict | None = None
         self.update_config = load_update_config()
+        self.user_settings = load_user_settings()
         self.last_fetched_url = ""
         self.last_output_path: Path | None = None
         self.url_fetch_timer = QTimer(self)
@@ -650,7 +769,7 @@ class MainWindow(QMainWindow):
 
         brand_wrap = QVBoxLayout()
         brand_wrap.setSpacing(4)
-        top_row.addLayout(brand_wrap, 1)
+        top_row.addLayout(brand_wrap)
 
         eyebrow = QLabel("MerchTools")
         eyebrow.setObjectName("eyebrow")
@@ -659,16 +778,20 @@ class MainWindow(QMainWindow):
         title = QLabel("Video Downloader")
         title.setObjectName("heroTitle")
         brand_wrap.addWidget(title)
+        top_row.addStretch(1)
+        pill_row = QHBoxLayout()
+        pill_row.setSpacing(12)
+        top_row.addLayout(pill_row)
+
+        self.check_updates_button = QPushButton("Check for updates")
+        self.check_updates_button.setObjectName("versionPillButton")
+        self.check_updates_button.clicked.connect(self.check_for_updates)
+        self.check_updates_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        pill_row.addWidget(self.check_updates_button)
 
         self.version_label = QLabel(f"v{APP_VERSION}")
         self.version_label.setObjectName("versionPill")
-        top_row.addWidget(self.version_label)
-
-        self.check_updates_button = QPushButton("Check Updates")
-        self.check_updates_button.setObjectName("secondaryButton")
-        self.check_updates_button.clicked.connect(self.check_for_updates)
-        top_row.addWidget(self.check_updates_button)
-        top_row.addStretch(1)
+        pill_row.addWidget(self.version_label)
 
         content = QHBoxLayout()
         content.setSpacing(16)
@@ -691,7 +814,8 @@ class MainWindow(QMainWindow):
         self.url_input.setObjectName("primaryInput")
         self.url_input.setPlaceholderText("Paste a YouTube or Twitch URL")
         self.url_input.textChanged.connect(self.on_url_changed)
-        self.output_dir_input = QLineEdit(str(DEFAULT_OUTPUT_DIR))
+        saved_output_dir = self.user_settings.get("output_dir") or str(DEFAULT_OUTPUT_DIR)
+        self.output_dir_input = QLineEdit(saved_output_dir)
         self.output_dir_input.setObjectName("primaryInput")
         self.filename_input = QLineEdit()
         self.filename_input.setPlaceholderText("Optional custom filename")
@@ -743,6 +867,7 @@ class MainWindow(QMainWindow):
 
         self.reveal_checkbox = QCheckBox("Reveal in Explorer after download completes")
         self.reveal_checkbox.setObjectName("optionToggle")
+        self.reveal_checkbox.setChecked(True)
         clip_card.content_layout.addWidget(self.reveal_checkbox)
 
         left_column.addStretch(1)
@@ -756,6 +881,7 @@ class MainWindow(QMainWindow):
         self.log_output.setReadOnly(True)
         self.log_output.setObjectName("logOutput")
         right_card.content_layout.addWidget(self.log_output)
+
         self.download_button = ProgressButton("Download")
         self.download_button.setObjectName("accentButton")
         self.download_button.clicked.connect(self.download_video)
@@ -763,6 +889,16 @@ class MainWindow(QMainWindow):
         self.download_button.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         right_card.content_layout.addWidget(self.download_button)
         right_card.content_layout.setStretch(0, 1)
+
+    def apply_window_icon(self) -> None:
+        for candidate in bundled_file_candidates("assets/app-icon.png"):
+            if candidate.exists():
+                icon = QIcon(str(candidate))
+                self.setWindowIcon(icon)
+                app = QApplication.instance()
+                if app is not None:
+                    app.setWindowIcon(icon)
+                return
 
     def build_stylesheet(self) -> str:
         return """
@@ -794,9 +930,23 @@ class MainWindow(QMainWindow):
             color: #cbbda8;
             font-size: 12px;
             font-weight: 700;
-            padding: 6px 10px;
-            border: 1px solid #2a2e33;
-            border-radius: 999px;
+            padding: 0px;
+        }
+        QPushButton#versionPillButton {
+            background: transparent;
+            color: #cbbda8;
+            font-size: 12px;
+            font-weight: 700;
+            padding: 0px;
+            border: none;
+        }
+        QPushButton#versionPillButton:hover {
+            color: #efe8dd;
+        }
+        QPushButton#versionPillButton:disabled {
+            background: transparent;
+            color: #7d766d;
+            border: none;
         }
         QLabel#hintText, QLabel#metaText {
             color: #cbbda8;
@@ -879,9 +1029,6 @@ class MainWindow(QMainWindow):
             font-weight: 700;
             padding: 13px 18px;
         }
-        QPushButton#secondaryButton {
-            padding: 10px 14px;
-        }
         QPlainTextEdit#logOutput {
             font-family: Consolas, monospace;
             font-size: 13px;
@@ -922,13 +1069,14 @@ class MainWindow(QMainWindow):
             latest_version = self.update_info.get("latest_version", "")
             self.check_updates_button.setText(f"Update v{latest_version}")
         else:
-            self.check_updates_button.setText("Check Updates")
+            self.check_updates_button.setText("Check for updates")
         self.check_updates_button.setDisabled(False)
 
     def choose_folder(self) -> None:
         folder = QFileDialog.getExistingDirectory(self, "Choose Save Folder", self.output_dir_input.text())
         if folder:
             self.output_dir_input.setText(folder)
+            self.persist_user_settings()
 
     def on_full_video_toggled(self, checked: bool) -> None:
         self.start_input.setDisabled(checked)
@@ -966,11 +1114,13 @@ class MainWindow(QMainWindow):
 
         command = self.resolve_yt_dlp_command()
         if not command:
+            self.append_log("yt-dlp command could not be resolved.")
             return
 
         self.is_fetching_info = True
         self.set_status("Fetching video info...")
         self.update_button_state()
+        self.append_log(f"Using yt-dlp command: {' '.join(command)}")
         self.append_log("Starting metadata lookup...")
         worker = InfoWorker(command, url)
         self.run_worker(
@@ -980,7 +1130,11 @@ class MainWindow(QMainWindow):
         )
 
     def download_video(self) -> None:
-        if not self.dependencies_ready or self.is_fetching_info or self.is_downloading:
+        if self.is_downloading:
+            self.cancel_download()
+            return
+
+        if not self.dependencies_ready or self.is_fetching_info:
             self.show_error("The app is still preparing or processing. Please wait a moment.")
             return
 
@@ -991,6 +1145,7 @@ class MainWindow(QMainWindow):
 
         output_dir = Path(self.output_dir_input.text().strip() or DEFAULT_OUTPUT_DIR)
         output_dir.mkdir(parents=True, exist_ok=True)
+        self.persist_user_settings()
         target_output_path = self.resolve_output_path(output_dir)
         if target_output_path.exists():
             answer = QMessageBox.question(
@@ -1099,11 +1254,15 @@ class MainWindow(QMainWindow):
         self.append_log(f"Duration: {format_seconds(self.video_duration)}")
         self.update_button_state()
 
-    def on_download_finished(self, _: object) -> None:
+    def on_download_finished(self, result: object) -> None:
         self.is_downloading = False
-        self.set_progress(100)
         self.set_status("Ready")
         self.update_button_state()
+        if isinstance(result, dict) and result.get("cancelled"):
+            self.cleanup_cancelled_download()
+            self.append_log("Cancelled the current download and removed partial files.")
+            return
+
         if self.reveal_checkbox.isChecked():
             self.reveal_in_explorer()
         QMessageBox.information(self, APP_TITLE, "Download completed successfully.")
@@ -1201,10 +1360,49 @@ class MainWindow(QMainWindow):
         can_download = (
             self.dependencies_ready
             and not self.is_fetching_info
-            and not self.is_downloading
             and bool(self.url_input.text().strip())
         )
         self.download_button.setDisabled(not can_download)
+
+    def cancel_download(self) -> None:
+        worker = self.active_worker
+        if not self.is_downloading or not isinstance(worker, DownloadWorker):
+            return
+        self.append_log("Cancelling download...")
+        worker.cancel()
+
+    def persist_user_settings(self) -> None:
+        save_user_settings({
+            "output_dir": self.output_dir_input.text().strip() or str(DEFAULT_OUTPUT_DIR),
+        })
+
+    def cleanup_cancelled_download(self) -> None:
+        target_path = self.last_output_path
+        output_dir = Path(self.output_dir_input.text().strip() or DEFAULT_OUTPUT_DIR)
+        candidates: list[Path] = []
+        if target_path is not None:
+            candidates.extend([
+                target_path,
+                target_path.with_suffix(".mp4.part"),
+                target_path.with_suffix(".part"),
+                target_path.with_suffix(".f140.mp4"),
+                target_path.with_suffix(".f251.webm"),
+            ])
+            stem = target_path.stem
+            candidates.extend(output_dir.glob(f"{stem}*.part"))
+            candidates.extend(output_dir.glob(f"{stem}*.ytdl"))
+            candidates.extend(output_dir.glob(f"{stem}*.temp"))
+
+        seen: set[Path] = set()
+        for candidate in candidates:
+            if candidate in seen:
+                continue
+            seen.add(candidate)
+            if candidate.exists():
+                try:
+                    candidate.unlink()
+                except OSError:
+                    pass
 
     def update_configured(self) -> bool:
         manifest_url = str(self.update_config.get("manifest_url", "")).strip()
@@ -1368,6 +1566,7 @@ class MainWindow(QMainWindow):
             command = None
 
         if not command:
+            self.append_log("yt-dlp was not found in the packaged app or on PATH.")
             self.show_error(
                 "yt-dlp is not installed.\n\n"
                 "Run: pip install yt-dlp\n"
@@ -1417,6 +1616,9 @@ class MainWindow(QMainWindow):
         invalid_chars = '<>:"/\\|?*'
         sanitized = "".join("_" if char in invalid_chars else char for char in value).strip()
         return sanitized.rstrip(". ") or "clip"
+
+    def is_frozen(self) -> bool:
+        return bool(getattr(sys, "frozen", False))
 
 
 def main() -> None:
