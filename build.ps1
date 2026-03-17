@@ -2,19 +2,43 @@ $ErrorActionPreference = "Stop"
 
 $ProjectRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 $PythonExe = "python"
-$AppName = "MerchTools - Video Downloader"
+$MetadataJson = & $PythonExe -c "import json; from app_metadata import APP_TITLE, APP_VERSION; print(json.dumps({'title': APP_TITLE, 'version': APP_VERSION}))"
+if ($LASTEXITCODE -ne 0 -or -not $MetadataJson) {
+    throw "Could not load app metadata from app_metadata.py"
+}
+$AppMetadata = $MetadataJson | ConvertFrom-Json
+$AppName = [string]$AppMetadata.title
+$AppVersion = [string]$AppMetadata.version
+$SpecPath = Join-Path $ProjectRoot "$AppName.spec"
 $DistDir = Join-Path $ProjectRoot "dist\$AppName"
 $BuildDir = Join-Path $ProjectRoot "build"
 $BuildTempDir = Join-Path $env:USERPROFILE "MerchToolsBuildTemp"
 $FfmpegSource = $env:YTCUTTER_FFMPEG_PATH
 $FfmpegTarget = Join-Path $ProjectRoot "ffmpeg.exe"
+$NodeSource = $env:YTDLP_NODE_PATH
+$NodeTarget = Join-Path $ProjectRoot "node.exe"
+$LatestJsonPath = Join-Path $ProjectRoot "latest.json"
 
 New-Item -ItemType Directory -Force -Path $BuildTempDir | Out-Null
 $env:TMP = $BuildTempDir
 $env:TEMP = $BuildTempDir
 
 & $PythonExe -m pip install --user --upgrade pip
+if ($LASTEXITCODE -ne 0) {
+    throw "pip upgrade failed with exit code $LASTEXITCODE"
+}
+
 & $PythonExe -m pip install --user -r (Join-Path $ProjectRoot "build_requirements.txt")
+if ($LASTEXITCODE -ne 0) {
+    throw "Installing build requirements failed with exit code $LASTEXITCODE"
+}
+
+if (Test-Path $LatestJsonPath) {
+    $LatestManifest = Get-Content $LatestJsonPath -Raw | ConvertFrom-Json
+    if ([string]$LatestManifest.version -ne $AppVersion) {
+        throw "latest.json version ($($LatestManifest.version)) does not match app version ($AppVersion)."
+    }
+}
 
 if ($FfmpegSource) {
     if (-not (Test-Path $FfmpegSource)) {
@@ -34,6 +58,24 @@ else {
     }
 }
 
+if ($NodeSource) {
+    if (-not (Test-Path $NodeSource)) {
+        throw "YTDLP_NODE_PATH points to a file that does not exist: $NodeSource"
+    }
+    Copy-Item $NodeSource $NodeTarget -Force
+    Write-Host "Bundled node runtime from $NodeSource"
+}
+else {
+    $ResolvedNode = (Get-Command node -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Source -ErrorAction SilentlyContinue)
+    if ($ResolvedNode -and (Test-Path $ResolvedNode)) {
+        Copy-Item $ResolvedNode $NodeTarget -Force
+        Write-Host "Bundled node runtime from PATH: $ResolvedNode"
+    }
+    else {
+        Write-Warning "Could not resolve node automatically. Set YTDLP_NODE_PATH to bundle node.exe into the app."
+    }
+}
+
 if (Test-Path $BuildDir) {
     Remove-Item $BuildDir -Recurse -Force
 }
@@ -42,139 +84,24 @@ if (Test-Path $DistDir) {
     Remove-Item $DistDir -Recurse -Force
 }
 
-$PyInstallerArgs = @(
-    "--noconfirm"
-    "--clean"
-    "--windowed"
-    "--icon"
-    (Join-Path $ProjectRoot "assets\app-icon.ico")
-    "--name"
-    $AppName
-    "--hidden-import"
-    "yt_dlp"
-    "--hidden-import"
-    "imageio_ffmpeg"
-    "--add-data"
-    "$ProjectRoot\README.md;."
-    "--add-data"
-    "$ProjectRoot\assets\app-icon.png;assets"
-    "--add-data"
-    "$ProjectRoot\update_config.json;."
-    "--add-data"
-    "$ProjectRoot\latest.example.json;."
-    "--exclude-module"
-    "PySide6.Qt3DAnimation"
-    "--exclude-module"
-    "PySide6.Qt3DCore"
-    "--exclude-module"
-    "PySide6.Qt3DExtras"
-    "--exclude-module"
-    "PySide6.Qt3DInput"
-    "--exclude-module"
-    "PySide6.Qt3DLogic"
-    "--exclude-module"
-    "PySide6.Qt3DRender"
-    "--exclude-module"
-    "PySide6.QtAxContainer"
-    "--exclude-module"
-    "PySide6.QtBluetooth"
-    "--exclude-module"
-    "PySide6.QtCharts"
-    "--exclude-module"
-    "PySide6.QtDataVisualization"
-    "--exclude-module"
-    "PySide6.QtDesigner"
-    "--exclude-module"
-    "PySide6.QtGraphs"
-    "--exclude-module"
-    "PySide6.QtHelp"
-    "--exclude-module"
-    "PySide6.QtHttpServer"
-    "--exclude-module"
-    "PySide6.QtLocation"
-    "--exclude-module"
-    "PySide6.QtMultimedia"
-    "--exclude-module"
-    "PySide6.QtMultimediaWidgets"
-    "--exclude-module"
-    "PySide6.QtNetworkAuth"
-    "--exclude-module"
-    "PySide6.QtNfc"
-    "--exclude-module"
-    "PySide6.QtOpenGL"
-    "--exclude-module"
-    "PySide6.QtOpenGLWidgets"
-    "--exclude-module"
-    "PySide6.QtPdf"
-    "--exclude-module"
-    "PySide6.QtPdfWidgets"
-    "--exclude-module"
-    "PySide6.QtPositioning"
-    "--exclude-module"
-    "PySide6.QtPrintSupport"
-    "--exclude-module"
-    "PySide6.QtQml"
-    "--exclude-module"
-    "PySide6.QtQuick"
-    "--exclude-module"
-    "PySide6.QtQuick3D"
-    "--exclude-module"
-    "PySide6.QtQuickControls2"
-    "--exclude-module"
-    "PySide6.QtRemoteObjects"
-    "--exclude-module"
-    "PySide6.QtScxml"
-    "--exclude-module"
-    "PySide6.QtSensors"
-    "--exclude-module"
-    "PySide6.QtSerialBus"
-    "--exclude-module"
-    "PySide6.QtSerialPort"
-    "--exclude-module"
-    "PySide6.QtSpatialAudio"
-    "--exclude-module"
-    "PySide6.QtSql"
-    "--exclude-module"
-    "PySide6.QtStateMachine"
-    "--exclude-module"
-    "PySide6.QtSvg"
-    "--exclude-module"
-    "PySide6.QtSvgWidgets"
-    "--exclude-module"
-    "PySide6.QtTest"
-    "--exclude-module"
-    "PySide6.QtTextToSpeech"
-    "--exclude-module"
-    "PySide6.QtUiTools"
-    "--exclude-module"
-    "PySide6.QtWebChannel"
-    "--exclude-module"
-    "PySide6.QtWebEngineCore"
-    "--exclude-module"
-    "PySide6.QtWebEngineQuick"
-    "--exclude-module"
-    "PySide6.QtWebEngineWidgets"
-    "--exclude-module"
-    "PySide6.QtWebSockets"
-    "--exclude-module"
-    "PySide6.QtWebView"
-    "--exclude-module"
-    "PySide6.QtXml"
-)
-
-if (Test-Path $FfmpegTarget) {
-    $PyInstallerArgs += @(
-        "--add-binary"
-        "$FfmpegTarget;."
-    )
+if (-not (Test-Path $SpecPath)) {
+    throw "PyInstaller spec file not found: $SpecPath"
 }
 
-$PyInstallerArgs += (Join-Path $ProjectRoot "app.py")
+try {
+    & $PythonExe -m PyInstaller --noconfirm --clean $SpecPath
+    if ($LASTEXITCODE -ne 0) {
+        throw "PyInstaller build failed with exit code $LASTEXITCODE"
+    }
+}
+finally {
+    if (Test-Path $FfmpegTarget) {
+        Remove-Item $FfmpegTarget -Force
+    }
 
-& $PythonExe -m PyInstaller @PyInstallerArgs
-
-if (Test-Path $FfmpegTarget) {
-    Remove-Item $FfmpegTarget -Force
+    if (Test-Path $NodeTarget) {
+        Remove-Item $NodeTarget -Force
+    }
 }
 
 Write-Host ""

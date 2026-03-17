@@ -10,3 +10,4 @@ installer-dist/
 downloads/
 ffmpeg.exe
 *.spec
+!MerchTools - Video Downloader.spec

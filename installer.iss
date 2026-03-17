@@ -1,8 +1,18 @@
-#define MyAppName "MerchTools - Video Downloader"
-#define MyAppVersion "1.0.4"
-#define MyAppPublisher "MerchEdits"
-#define MyAppExeName "MerchTools - Video Downloader.exe"
-#define MyAppSourceDir "dist\MerchTools - Video Downloader"
+#ifndef MyAppName
+  #define MyAppName "MerchTools - Video Downloader"
+#endif
+#ifndef MyAppVersion
+  #define MyAppVersion "1.0.4"
+#endif
+#ifndef MyAppPublisher
+  #define MyAppPublisher "MerchEdits"
+#endif
+#ifndef MyAppExeName
+  #define MyAppExeName "MerchTools - Video Downloader.exe"
+#endif
+#ifndef MyAppSourceDir
+  #define MyAppSourceDir "dist\MerchTools - Video Downloader"
+#endif
 
 [Setup]
 AppId={{4A4B5B6E-DB5D-4FDF-A337-6BB269AB2DF2}

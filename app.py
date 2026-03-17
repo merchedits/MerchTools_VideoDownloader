@@ -1,13 +1,19 @@
 import importlib
 import json
+import math
 import os
+import random
 import re
 import shutil
+import struct
 import ssl
 import subprocess
 import sys
 import tempfile
+import threading
 import time
+import wave
+from datetime import datetime
 from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qs, urlparse
@@ -20,8 +26,9 @@ except ImportError:
 
 from yt_dlp import YoutubeDL
 from yt_dlp.utils import DownloadError, download_range_func
-from PySide6.QtCore import QObject, QThread, Qt, Signal, QTimer
-from PySide6.QtGui import QColor, QFont, QIcon, QPainter, QPen
+from yt_dlp.downloader import external as yt_dlp_external
+from PySide6.QtCore import QObject, QPoint, QThread, Qt, Signal, QTimer
+from PySide6.QtGui import QColor, QFont, QIcon, QPainter, QPen, QPixmap, QPolygon
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -40,12 +47,18 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from app_metadata import APP_TITLE, APP_VERSION
 
-APP_TITLE = "MerchTools - Video Downloader"
-APP_VERSION = "1.0.4"
+try:
+    import winsound
+except ImportError:
+    winsound = None
+
 DEFAULT_OUTPUT_DIR = Path.home() / "Documents" / "MerchTools" / "Video Downloader"
 UPDATE_CONFIG_FILENAME = "update_config.json"
 SETTINGS_FILENAME = "user_settings.json"
+NODE_RUNTIME_FILENAME = "node.exe"
+DEFAULT_DOWNLOAD_FORMAT = "bestvideo*+bestaudio/best"
 REQUIRED_PYTHON_PACKAGES = [
     ("yt_dlp", "yt-dlp"),
     ("imageio_ffmpeg", "imageio-ffmpeg"),
@@ -144,6 +157,35 @@ def bundled_file_candidates(filename: str) -> list[Path]:
         base_dir / "_internal" / filename,
         Path(__file__).resolve().parent / filename,
     ]
+
+
+def bundled_executable_path(filename: str) -> str | None:
+    for candidate in bundled_file_candidates(filename):
+        if candidate.exists():
+            return str(candidate)
+    return None
+
+
+def resolve_js_runtime_executable() -> str | None:
+    bundled_runtime = bundled_executable_path(NODE_RUNTIME_FILENAME)
+    if bundled_runtime:
+        return bundled_runtime
+    return shutil.which("node")
+
+
+def yt_dlp_js_runtime_options() -> dict:
+    node_path = resolve_js_runtime_executable()
+    if not node_path:
+        return {}
+    return {
+        "js_runtimes": {"node": {"path": node_path}},
+        "remote_components": ["ejs:github"],
+        "extractor_args": {
+            "youtube": {
+                "player_client": ["tv", "android_vr", "web"],
+            }
+        },
+    }
 
 
 def user_data_dir() -> Path:
@@ -370,6 +412,11 @@ class DependencyWorker(BaseWorker):
                 raise RuntimeError("ffmpeg could not be prepared.")
 
             self.log(f"Using ffmpeg at: {ffmpeg_path}")
+            js_runtime_path = resolve_js_runtime_executable()
+            if js_runtime_path:
+                self.log(f"Using JavaScript runtime at: {js_runtime_path}")
+            else:
+                self.log("No JavaScript runtime found. Some YouTube formats may be unavailable until node is installed.")
             self.log("Dependency check complete.")
             self.signals.finished.emit({"ffmpeg_path": ffmpeg_path})
         except Exception as error:  # noqa: BLE001
@@ -474,6 +521,7 @@ class InfoWorker(BaseWorker):
                     "fragment_retries": 10,
                     "logger": YtDlpWorkerLogger(self),
                 }
+                options.update(yt_dlp_js_runtime_options())
                 with YoutubeDL(options) as ydl:
                     data = ydl.extract_info(self.url, download=False)
                 self.signals.finished.emit(data)
@@ -510,12 +558,25 @@ class DownloadWorker(BaseWorker):
         self.end_seconds = end_seconds
         self.cancel_requested = False
         self.ydl: YoutubeDL | None = None
+        self.ffmpeg_process = None
+        self.ffmpeg_progress_state: dict[str, str] = {}
+        self.last_progress_percent = -1
+        self.last_progress_log_time = 0.0
+        self.ffmpeg_progress_base = 0
+        self.ffmpeg_progress_span = 100
+        self.ffmpeg_progress_duration: float | int | None = expected_duration
+        self.ffmpeg_progress_label = "Download progress"
 
     def cancel(self) -> None:
+        if self.cancel_requested:
+            return
         self.cancel_requested = True
-        ydl = self.ydl
-        if ydl is not None:
-            ydl._download_retcode = 1
+        ffmpeg_process = self.ffmpeg_process
+        if ffmpeg_process is not None and ffmpeg_process.poll() is None:
+            try:
+                ffmpeg_process.kill(timeout=None)
+            except Exception:  # noqa: BLE001
+                pass
 
     def run(self) -> None:
         self.set_status("Downloading...")
@@ -531,29 +592,7 @@ class DownloadWorker(BaseWorker):
                 return
 
             try:
-                options = {
-                    "quiet": True,
-                    "noplaylist": True,
-                    "forceipv4": True,
-                    "socket_timeout": 30,
-                    "retries": 10,
-                    "extractor_retries": 5,
-                    "fragment_retries": 10,
-                    "format": "bestvideo*+bestaudio/best",
-                    "merge_output_format": "mp4",
-                    "ffmpeg_location": self.ffmpeg_path,
-                    "outtmpl": self.output_template,
-                    "force_keyframes_at_cuts": self.start_seconds is not None and self.end_seconds is not None,
-                    "progress_hooks": [self.on_progress],
-                    "logger": YtDlpWorkerLogger(self),
-                }
-                if self.start_seconds is not None and self.end_seconds is not None:
-                    options["download_ranges"] = download_range_func(None, [(self.start_seconds, self.end_seconds)])
-
-                with YoutubeDL(options) as ydl:
-                    self.ydl = ydl
-                    code = ydl.download([self.url])
-                self.ydl = None
+                code = self.run_standard_download()
                 if self.cancel_requested:
                     self.log("Download cancelled.")
                     self.signals.finished.emit({"cancelled": True})
@@ -565,9 +604,25 @@ class DownloadWorker(BaseWorker):
                     return
                 last_error = f"Download failed with exit code {code}."
                 self.log(last_error)
+            except KeyboardInterrupt:
+                self.ydl = None
+                self.ffmpeg_process = None
+                if self.cancel_requested:
+                    self.log("Download cancelled by user.")
+                    self.signals.finished.emit({"cancelled": True})
+                    return
+                last_error = "Download interrupted."
             except DownloadError as error:
+                self.ydl = None
+                self.ffmpeg_process = None
+                if self.cancel_requested:
+                    self.log("Download cancelled by user.")
+                    self.signals.finished.emit({"cancelled": True})
+                    return
                 last_error = str(error).strip() or "Download failed."
             except Exception as error:  # noqa: BLE001
+                self.ydl = None
+                self.ffmpeg_process = None
                 last_error = str(error).strip() or "Download failed."
 
             self.log(last_error)
@@ -579,9 +634,147 @@ class DownloadWorker(BaseWorker):
             self.emit_error(last_error)
             return
 
+    def run_standard_download(self) -> int:
+        self.ffmpeg_progress_base = 0
+        self.ffmpeg_progress_span = 100
+        self.ffmpeg_progress_duration = self.expected_duration
+        self.ffmpeg_progress_label = "Download progress"
+
+        options = {
+            "quiet": True,
+            "noplaylist": True,
+            "forceipv4": True,
+            "socket_timeout": 30,
+            "retries": 10,
+            "extractor_retries": 5,
+            "fragment_retries": 10,
+            "format": DEFAULT_DOWNLOAD_FORMAT,
+            "merge_output_format": "mp4",
+            "ffmpeg_location": self.ffmpeg_path,
+            "outtmpl": self.output_template,
+            "force_keyframes_at_cuts": self.start_seconds is not None and self.end_seconds is not None,
+            "progress_hooks": [self.on_progress],
+            "logger": YtDlpWorkerLogger(self),
+        }
+        options.update(yt_dlp_js_runtime_options())
+        options["external_downloader_args"] = {"ffmpeg_o": ["-progress", "pipe:2", "-nostats"]}
+        if self.start_seconds is not None and self.end_seconds is not None:
+            options["download_ranges"] = download_range_func(None, [(self.start_seconds, self.end_seconds)])
+
+        original_popen = yt_dlp_external.Popen
+        yt_dlp_external.Popen = self.make_tracking_popen(original_popen)
+        try:
+            with YoutubeDL(options) as ydl:
+                self.ydl = ydl
+                code = ydl.download([self.url])
+            self.ydl = None
+        finally:
+            yt_dlp_external.Popen = original_popen
+            self.ffmpeg_process = None
+            self.ffmpeg_progress_state = {}
+        return code
+
+    def make_tracking_popen(self, base_popen):
+        worker = self
+
+        class TrackingPopen(base_popen):
+            def __init__(self, args, *remaining, **kwargs):
+                executable = str(args[0]).lower() if args else ""
+                is_ffmpeg = executable.endswith("ffmpeg") or executable.endswith("ffmpeg.exe")
+                if is_ffmpeg:
+                    kwargs["stderr"] = subprocess.PIPE
+                    kwargs["stdout"] = subprocess.DEVNULL
+                    kwargs["text"] = True
+                    kwargs.setdefault("encoding", "utf-8")
+                    kwargs.setdefault("errors", "replace")
+                super().__init__(args, *remaining, **kwargs)
+                if is_ffmpeg:
+                    worker.attach_ffmpeg_process(self)
+
+        return TrackingPopen
+
+    def attach_ffmpeg_process(self, process) -> None:
+        self.ffmpeg_process = process
+        stderr = process.stderr
+        if stderr is None:
+            return
+
+        def consume_stderr() -> None:
+            try:
+                for raw_line in stderr:
+                    line = raw_line.strip()
+                    if line:
+                        self.on_ffmpeg_output(line)
+            except Exception:  # noqa: BLE001
+                return
+
+        thread = threading.Thread(target=consume_stderr, daemon=True)
+        thread.start()
+
+    def on_ffmpeg_output(self, line: str) -> None:
+        if "=" not in line:
+            return
+
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip()
+        self.ffmpeg_progress_state[key] = value
+
+        if key != "progress":
+            return
+
+        percentage = self.ffmpeg_progress_percentage()
+        if percentage is not None:
+            self.signals.progress.emit(percentage)
+            self.log_ffmpeg_progress(percentage)
+
+    def ffmpeg_progress_percentage(self) -> int | None:
+        duration = self.ffmpeg_progress_duration
+        if not duration or duration <= 0:
+            return None
+
+        out_time_ms = self.ffmpeg_progress_state.get("out_time_ms")
+        if not out_time_ms or out_time_ms == "N/A":
+            return None
+
+        try:
+            out_time_seconds = float(out_time_ms) / 1_000_000
+        except ValueError:
+            return None
+
+        local_percentage = int((out_time_seconds / float(duration)) * 100)
+        local_percentage = max(0, min(99, local_percentage))
+        overall_percentage = self.ffmpeg_progress_base + int((local_percentage / 100) * self.ffmpeg_progress_span)
+        return max(0, min(99, overall_percentage))
+
+    def log_ffmpeg_progress(self, percentage: int) -> None:
+        now = time.monotonic()
+        if percentage == self.last_progress_percent and (now - self.last_progress_log_time) < 1.5:
+            return
+        if percentage != self.last_progress_percent and (now - self.last_progress_log_time) < 0.6:
+            return
+
+        self.last_progress_percent = percentage
+        self.last_progress_log_time = now
+
+        details: list[str] = []
+        out_time = self.ffmpeg_progress_state.get("out_time")
+        speed = self.ffmpeg_progress_state.get("speed")
+        total_size = self.ffmpeg_progress_state.get("total_size")
+
+        if out_time and out_time != "N/A" and self.ffmpeg_progress_duration:
+            details.append(f"{out_time} / {format_seconds(self.ffmpeg_progress_duration)}")
+        if total_size and total_size.isdigit():
+            details.append(self.format_bytes(int(total_size)))
+        if speed and speed != "N/A":
+            details.append(f"speed {speed}")
+
+        suffix = f" ({', '.join(details)})" if details else ""
+        self.log(f"{self.ffmpeg_progress_label}: {percentage}%{suffix}")
+
     def on_progress(self, data: dict) -> None:
         if self.cancel_requested:
-            raise DownloadError("Download cancelled by user.")
+            raise KeyboardInterrupt
 
         status = data.get("status")
         if status == "finished":
@@ -593,9 +786,83 @@ class DownloadWorker(BaseWorker):
 
         total_bytes = data.get("total_bytes") or data.get("total_bytes_estimate")
         downloaded_bytes = data.get("downloaded_bytes")
+        percentage: int | None = None
         if total_bytes and downloaded_bytes is not None:
             percentage = int((downloaded_bytes / total_bytes) * 100)
-            self.signals.progress.emit(max(0, min(100, percentage)))
+        else:
+            percent_text = str(data.get("_percent_str") or "").strip().replace("%", "")
+            if percent_text:
+                try:
+                    percentage = int(float(percent_text))
+                except ValueError:
+                    percentage = None
+
+        if percentage is None:
+            fragment_count = data.get("fragment_count")
+            fragment_index = data.get("fragment_index")
+            if fragment_count and fragment_index:
+                percentage = int((fragment_index / fragment_count) * 100)
+
+        if percentage is None:
+            eta = data.get("eta")
+            elapsed = data.get("elapsed")
+            if isinstance(eta, (int, float)) and isinstance(elapsed, (int, float)) and eta > 0:
+                percentage = int((elapsed / (elapsed + eta)) * 100)
+                percentage = max(0, min(99, percentage))
+
+        if percentage is not None:
+            clamped_percentage = max(0, min(100, percentage))
+            self.signals.progress.emit(clamped_percentage)
+            self.log_progress_update(data, clamped_percentage)
+            return
+
+    def log_progress_update(self, data: dict, percentage: int) -> None:
+        now = time.monotonic()
+        if percentage == self.last_progress_percent and (now - self.last_progress_log_time) < 1.5:
+            return
+        if percentage != self.last_progress_percent and percentage < 100 and (now - self.last_progress_log_time) < 0.6:
+            return
+
+        self.last_progress_percent = percentage
+        self.last_progress_log_time = now
+
+        downloaded_bytes = data.get("downloaded_bytes")
+        total_bytes = data.get("total_bytes") or data.get("total_bytes_estimate")
+        speed = data.get("speed")
+        eta = data.get("eta")
+        fragment_index = data.get("fragment_index")
+        fragment_count = data.get("fragment_count")
+
+        details: list[str] = []
+        if downloaded_bytes is not None and total_bytes:
+            details.append(f"{self.format_bytes(downloaded_bytes)} / {self.format_bytes(total_bytes)}")
+        elif downloaded_bytes is not None:
+            details.append(self.format_bytes(downloaded_bytes))
+
+        if speed:
+            details.append(f"{self.format_bytes(speed)}/s")
+        if eta is not None:
+            details.append(f"ETA {format_seconds(eta)}")
+        if fragment_index and fragment_count:
+            details.append(f"frag {fragment_index}/{fragment_count}")
+
+        suffix = f" ({', '.join(details)})" if details else ""
+        self.log(f"Download progress: {percentage}%{suffix}")
+
+    @staticmethod
+    def format_bytes(value: float | int | None) -> str:
+        if value is None:
+            return "Unknown"
+        units = ["B", "KiB", "MiB", "GiB", "TiB"]
+        size = float(value)
+        unit = units[0]
+        for unit in units:
+            if size < 1024 or unit == units[-1]:
+                break
+            size /= 1024
+        if unit == "B":
+            return f"{int(size)}{unit}"
+        return f"{size:.2f}{unit}"
 
 
 class UpdateCheckWorker(BaseWorker):
@@ -741,6 +1008,113 @@ class CardFrame(QFrame):
         layout.addLayout(self.content_layout)
 
 
+class CatSpriteLabel(QLabel):
+    clicked = Signal(object)
+
+    def mousePressEvent(self, event) -> None:  # type: ignore[override]
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.clicked.emit(self)
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+
+class PixelExplosion(QWidget):
+    def __init__(self, parent: QWidget, center: QPoint, color: QColor) -> None:
+        super().__init__(parent)
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        self.setStyleSheet("background: transparent;")
+        self.resize(parent.size())
+        self.particles: list[dict] = []
+        self.life = 18
+        flame_colors = [
+            QColor("#fff1b8"),
+            QColor("#ffd166"),
+            QColor("#ff9f43"),
+            QColor("#ff6b35"),
+            QColor(color),
+        ]
+        smoke_colors = [
+            QColor("#6d625f"),
+            QColor("#4d4542"),
+            QColor("#8b807b"),
+        ]
+        for _ in range(16):
+            self.particles.append({
+                "x": float(center.x() + random.randint(-8, 8)),
+                "y": float(center.y() + random.randint(-8, 8)),
+                "dx": random.uniform(-5.8, 5.8),
+                "dy": random.uniform(-6.8, 2.6),
+                "size": random.randint(6, 12),
+                "color": QColor(random.choice(flame_colors)),
+                "gravity": 0.30,
+                "shrink": 0.42,
+                "kind": "flame",
+            })
+        for _ in range(10):
+            self.particles.append({
+                "x": float(center.x() + random.randint(-5, 5)),
+                "y": float(center.y() + random.randint(-5, 5)),
+                "dx": random.uniform(-2.2, 2.2),
+                "dy": random.uniform(-3.8, -0.6),
+                "size": random.randint(8, 15),
+                "color": QColor(random.choice(smoke_colors)),
+                "gravity": -0.03,
+                "shrink": 0.18,
+                "kind": "smoke",
+            })
+        for _ in range(12):
+            self.particles.append({
+                "x": float(center.x()),
+                "y": float(center.y()),
+                "dx": random.uniform(-7.5, 7.5),
+                "dy": random.uniform(-4.5, 3.5),
+                "size": random.randint(2, 4),
+                "color": QColor("#fff4d1"),
+                "gravity": 0.16,
+                "shrink": 0.08,
+                "kind": "spark",
+            })
+        self.timer = QTimer(self)
+        self.timer.setInterval(32)
+        self.timer.timeout.connect(self.advance_frame)
+        self.show()
+        self.raise_()
+        self.timer.start()
+
+    def advance_frame(self) -> None:
+        self.life -= 1
+        for particle in self.particles:
+            particle["x"] += particle["dx"]
+            particle["y"] += particle["dy"]
+            particle["dy"] += particle["gravity"]
+            particle["size"] = max(1, particle["size"] - particle["shrink"])
+            if particle["kind"] == "smoke":
+                particle["dx"] *= 0.98
+            else:
+                particle["dx"] *= 0.99
+        self.update()
+        if self.life <= 0:
+            self.timer.stop()
+            self.deleteLater()
+
+    def paintEvent(self, event) -> None:  # type: ignore[override]
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, False)
+        for particle in self.particles:
+            color = QColor(particle["color"])
+            alpha_scale = 13 if particle["kind"] == "smoke" else 18
+            color.setAlpha(max(18, min(255, self.life * alpha_scale)))
+            painter.fillRect(
+                int(particle["x"]),
+                int(particle["y"]),
+                int(particle["size"]),
+                int(particle["size"]),
+                color,
+            )
+
+
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
@@ -748,8 +1122,6 @@ class MainWindow(QMainWindow):
         self.resize(1120, 760)
         self.setMinimumSize(980, 760)
         self.apply_window_icon()
-
-        DEFAULT_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
         self.dependencies_ready = False
         self.is_fetching_info = False
@@ -767,16 +1139,28 @@ class MainWindow(QMainWindow):
         self.update_info: dict | None = None
         self.update_config = load_update_config()
         self.user_settings = load_user_settings()
+        self.cat_mode_enabled = bool(self.user_settings.get("cat_mode"))
         self.last_fetched_url = ""
         self.last_output_path: Path | None = None
+        self.log_file_path = self.initialize_log_file()
+        self._youtube_warning_logged = False
+        self._last_display_log: str | None = None
+        self._last_activity_phase: str | None = None
+        self.root_widget: QWidget | None = None
+        self.cat_sprites: list[dict] = []
+        self.kittycat_sound_path = self.prepare_kittycat_sound()
+        self.cat_timer = QTimer(self)
+        self.cat_timer.setInterval(40)
+        self.cat_timer.timeout.connect(self.tick_cat_sprites)
         self.url_fetch_timer = QTimer(self)
         self.url_fetch_timer.setInterval(1100)
         self.url_fetch_timer.setSingleShot(True)
         self.url_fetch_timer.timeout.connect(self.fetch_info_if_ready)
 
         self.setFont(QFont("Segoe UI", 10))
-        self.setStyleSheet(self.build_stylesheet())
+        self.setStyleSheet(self.build_stylesheet(self.cat_mode_enabled))
         self.build_ui()
+        self.apply_cat_mode(self.cat_mode_enabled)
         self.update_button_state()
         self.refresh_update_button()
         self.append_log(f"App version: {APP_VERSION}")
@@ -785,6 +1169,7 @@ class MainWindow(QMainWindow):
 
     def build_ui(self) -> None:
         root = QWidget()
+        self.root_widget = root
         self.setCentralWidget(root)
         outer = QVBoxLayout(root)
         outer.setContentsMargins(20, 20, 20, 20)
@@ -876,10 +1261,9 @@ class MainWindow(QMainWindow):
 
         self.start_input = QLineEdit()
         self.start_input.setObjectName("timeInput")
-        self.start_input.setPlaceholderText("9:32")
         self.end_input = QLineEdit()
         self.end_input.setObjectName("timeInput")
-        self.end_input.setPlaceholderText("9:43")
+        self.update_clip_range_placeholders()
 
         clip_grid.addWidget(self.make_field_label("Start Time"), 0, 0)
         clip_grid.addWidget(self.start_input, 0, 1)
@@ -900,6 +1284,12 @@ class MainWindow(QMainWindow):
         self.reveal_checkbox.setObjectName("optionToggle")
         self.reveal_checkbox.setChecked(True)
         clip_card.content_layout.addWidget(self.reveal_checkbox)
+
+        self.cat_checkbox = QCheckBox("Kittycat")
+        self.cat_checkbox.setObjectName("optionToggle")
+        self.cat_checkbox.setChecked(self.cat_mode_enabled)
+        self.cat_checkbox.toggled.connect(self.on_cat_mode_toggled)
+        clip_card.content_layout.addWidget(self.cat_checkbox)
 
         left_column.addStretch(1)
 
@@ -931,148 +1321,630 @@ class MainWindow(QMainWindow):
                     app.setWindowIcon(icon)
                 return
 
-    def build_stylesheet(self) -> str:
-        return """
-        QWidget {
-            background: #131516;
+    def build_stylesheet(self, cat_mode: bool = False) -> str:
+        main_background = "#131516"
+        window_background = "#131516"
+        card_border = "#2a2e33"
+        card_background = "transparent"
+        input_background = "#171a1d"
+        primary_input_background = "#1b1f23"
+        primary_input_border = "#3a4148"
+        button_background = "#1b1f23"
+        button_hover = "#23282d"
+        if cat_mode:
+            main_background = "#1b1715"
+            window_background = "#201816"
+            card_border = "transparent"
+            card_background = "transparent"
+            input_background = "#211917"
+            primary_input_background = "#2a211d"
+            primary_input_border = "#7b6159"
+            button_background = "#2d221f"
+            button_hover = "#382925"
+
+        return f"""
+        QWidget {{
+            background: {main_background};
             color: #efe8dd;
-        }
-        QMainWindow {
-            background: #131516;
-        }
-        QFrame#card {
-            background: transparent;
-            border: 1px solid #2a2e33;
+        }}
+        QMainWindow {{
+            background: {window_background};
+        }}
+        QFrame#card {{
+            background: {card_background};
+            border: 1px solid {card_border};
             border-radius: 20px;
-        }
-        QLabel#eyebrow {
+        }}
+        QLabel#eyebrow {{
             color: #cbbda8;
             font-size: 12px;
             font-weight: 600;
             letter-spacing: 0.08em;
             text-transform: uppercase;
-        }
-        QLabel#heroTitle {
+        }}
+        QLabel#heroTitle {{
             font-family: "Trebuchet MS";
             font-size: 32px;
             font-weight: 700;
-        }
-        QLabel#versionPill {
+        }}
+        QLabel#versionPill {{
             color: #cbbda8;
             font-size: 12px;
             font-weight: 700;
             padding: 0px;
-        }
-        QPushButton#versionPillButton {
+        }}
+        QPushButton#versionPillButton {{
             background: transparent;
             color: #cbbda8;
             font-size: 12px;
             font-weight: 700;
             padding: 0px;
             border: none;
-        }
-        QPushButton#versionPillButton:hover {
+        }}
+        QPushButton#versionPillButton:hover {{
             color: #efe8dd;
-        }
-        QPushButton#versionPillButton:disabled {
+        }}
+        QPushButton#versionPillButton:disabled {{
             background: transparent;
             color: #7d766d;
             border: none;
-        }
-        QLabel#hintText, QLabel#metaText {
+        }}
+        QLabel#hintText, QLabel#metaText {{
             color: #cbbda8;
             line-height: 1.4;
-        }
-        QCheckBox#optionToggle {
+        }}
+        QCheckBox#optionToggle {{
             color: #efe8dd;
             spacing: 10px;
             font-size: 13px;
-        }
-        QCheckBox#optionToggle::indicator {
+        }}
+        QCheckBox#optionToggle::indicator {{
             width: 18px;
             height: 18px;
             border-radius: 5px;
             border: 1px solid #3a4148;
             background: #171a1d;
-        }
-        QCheckBox#optionToggle::indicator:checked {
+        }}
+        QCheckBox#optionToggle::indicator:checked {{
             background: #ff9a55;
             border: 1px solid #ff9a55;
-        }
-        QLabel#cardTitle {
+        }}
+        QLabel#cardTitle {{
             color: #efe8dd;
             font-family: "Trebuchet MS";
             font-size: 20px;
             font-weight: 700;
-        }
-        QLabel#fieldLabel {
+        }}
+        QLabel#fieldLabel {{
             color: #efe8dd;
             font-size: 12px;
             font-weight: 600;
             letter-spacing: 0.04em;
-        }
-        QLineEdit, QPlainTextEdit {
-            background: #171a1d;
-            border: 1px solid #2a2e33;
+        }}
+        QLineEdit, QPlainTextEdit {{
+            background: {input_background};
+            border: 1px solid {card_border};
             border-radius: 12px;
             padding: 12px 14px;
             color: #efe8dd;
             selection-background-color: #ff9a55;
             selection-color: #1a1613;
-        }
-        QLineEdit#primaryInput {
+        }}
+        QLineEdit#primaryInput {{
             font-size: 14px;
             font-weight: 600;
             min-height: 26px;
-            background: #1b1f23;
-            border: 1px solid #3a4148;
-        }
-        QLineEdit#timeInput {
+            background: {primary_input_background};
+            border: 1px solid {primary_input_border};
+        }}
+        QLineEdit#timeInput {{
             min-height: 24px;
             font-size: 13px;
-        }
-        QLineEdit:disabled {
+        }}
+        QLineEdit:disabled {{
             background: #101214;
             color: #72767c;
             border: 1px solid #262a2f;
-        }
-        QLineEdit:focus, QPlainTextEdit:focus {
+        }}
+        QLineEdit:focus, QPlainTextEdit:focus {{
             border: 1px solid #ff9a55;
-        }
-        QPushButton {
-            background: #1b1f23;
+        }}
+        QPushButton {{
+            background: {button_background};
             color: #efe8dd;
-            border: 1px solid #2a2e33;
+            border: 1px solid {card_border};
             border-radius: 12px;
             padding: 12px 16px;
             font-weight: 600;
-        }
-        QPushButton:hover {
-            background: #23282d;
-        }
-        QPushButton:disabled {
+        }}
+        QPushButton:hover {{
+            background: {button_hover};
+        }}
+        QPushButton:disabled {{
             background: #171a1d;
             color: #7d766d;
             border-color: #22262a;
-        }
-        QPushButton#accentButton {
+        }}
+        QPushButton#accentButton {{
             font-size: 14px;
             font-weight: 700;
             padding: 13px 18px;
-        }
-        QPlainTextEdit#logOutput {
+        }}
+        QPlainTextEdit#logOutput {{
             font-family: Consolas, monospace;
             font-size: 13px;
-        }
+        }}
         """
+
+    def on_cat_mode_toggled(self, checked: bool) -> None:
+        self.apply_cat_mode(checked)
+        self.persist_user_settings()
+
+    def apply_cat_mode(self, enabled: bool) -> None:
+        self.cat_mode_enabled = enabled
+        self.setStyleSheet(self.build_stylesheet(enabled))
+        if enabled:
+            self.create_cat_sprites()
+            self.cat_timer.start()
+            self.append_log("Cat mode enabled.")
+        else:
+            self.cat_timer.stop()
+            self.remove_cat_sprites()
+            self.append_log("Cat mode disabled.")
+
+    def prepare_kittycat_sound(self) -> Path | None:
+        if winsound is None:
+            return None
+        try:
+            sound_dir = user_data_dir() / "sounds"
+            sound_dir.mkdir(parents=True, exist_ok=True)
+            sound_path = sound_dir / "kittycat-pop.wav"
+            if sound_path.exists():
+                return sound_path
+
+            sample_rate = 22050
+            duration = 0.42
+            frame_count = int(sample_rate * duration)
+            frames = bytearray()
+            for index in range(frame_count):
+                t = index / sample_rate
+                envelope = math.exp(-7.5 * t)
+                pop = math.sin(2 * math.pi * (92 + 40 * t) * t) * envelope * 0.16
+                crackle = math.sin(2 * math.pi * 180 * t) * math.exp(-18 * t) * 0.05
+                meow_delay = max(0.0, t - 0.08)
+                meow = math.sin(2 * math.pi * (720 - 260 * meow_delay) * meow_delay) * math.exp(-5.6 * meow_delay) * 0.11
+                sample = max(-1.0, min(1.0, pop + crackle + meow))
+                frames.extend(struct.pack("<h", int(sample * 32767)))
+
+            with wave.open(str(sound_path), "wb") as wav_file:
+                wav_file.setnchannels(1)
+                wav_file.setsampwidth(2)
+                wav_file.setframerate(sample_rate)
+                wav_file.writeframes(bytes(frames))
+            return sound_path
+        except OSError:
+            return None
+
+    def play_kittycat_sound(self) -> None:
+        if winsound is None or self.kittycat_sound_path is None:
+            return
+        try:
+            winsound.PlaySound(
+                str(self.kittycat_sound_path),
+                winsound.SND_FILENAME | winsound.SND_ASYNC | winsound.SND_NODEFAULT,
+            )
+        except RuntimeError:
+            return
+
+    def choose_cat_variant(self) -> dict:
+        return random.choice([
+            {
+                "fur": QColor("#f3cfb1"),
+                "outline": QColor("#5b4039"),
+                "ears": QColor("#f6b7ba"),
+                "eyes": QColor("#302624"),
+                "blush": QColor("#f2a5a3"),
+                "face_scale": 0.64,
+                "ear_height": 0.08,
+                "cheek_fluff": 0.0,
+            },
+            {
+                "fur": QColor("#d7d2cb"),
+                "outline": QColor("#4d4d57"),
+                "ears": QColor("#f3c2d3"),
+                "eyes": QColor("#23252c"),
+                "blush": QColor("#dfb0bf"),
+                "face_scale": 0.68,
+                "ear_height": 0.06,
+                "cheek_fluff": 0.03,
+            },
+            {
+                "fur": QColor("#232020"),
+                "outline": QColor("#c5b4ae"),
+                "ears": QColor("#c89198"),
+                "eyes": QColor("#f2efe8"),
+                "blush": QColor("#9c6e74"),
+                "face_scale": 0.62,
+                "ear_height": 0.10,
+                "cheek_fluff": 0.01,
+            },
+            {
+                "fur": QColor("#f0c79d"),
+                "outline": QColor("#8a5f43"),
+                "ears": QColor("#f2aab0"),
+                "eyes": QColor("#4b311d"),
+                "blush": QColor("#ef9e92"),
+                "face_scale": 0.60,
+                "ear_height": 0.09,
+                "cheek_fluff": 0.04,
+            },
+            {
+                "fur": QColor("#e9dfcf"),
+                "outline": QColor("#6c645e"),
+                "ears": QColor("#f4c2c7"),
+                "eyes": QColor("#2d2926"),
+                "blush": QColor("#e8b1ab"),
+                "face_scale": 0.70,
+                "ear_height": 0.05,
+                "cheek_fluff": 0.05,
+            },
+        ])
+
+    def build_cat_sprite(self, layer: str | None = None) -> dict | None:
+        if self.root_widget is None:
+            return None
+
+        variant = self.choose_cat_variant()
+        layer = "foreground"
+        size_bucket = random.random()
+        if size_bucket < 0.2:
+            size = random.randint(34, 50)
+        elif size_bucket < 0.55:
+            size = random.randint(54, 90)
+        else:
+            size = random.randint(96, 156)
+        label = CatSpriteLabel(self.root_widget)
+        label.setPixmap(self.create_cat_pixmap(size, variant))
+        label.setFixedSize(size, size)
+        label.setStyleSheet("background: transparent;")
+        label.clicked.connect(self.on_cat_clicked)
+        label.show()
+        label.raise_()
+
+        x_limit = max(1, self.root_widget.width() - size)
+        y_limit = max(1, self.root_widget.height() - size)
+        sprite = {
+            "label": label,
+            "layer": layer,
+            "variant": variant,
+            "x": float(random.randint(0, x_limit)),
+            "y": float(random.randint(0, y_limit)),
+            "dx": random.choice([-1.0, 1.0]) * random.uniform(0.70, 1.35),
+            "dy": random.choice([-1.0, 1.0]) * random.uniform(0.18, 0.42),
+            "phase": random.uniform(0.0, 6.28),
+            "phase_step": random.uniform(0.07, 0.12),
+            "bob": random.uniform(0.10, 0.22),
+        }
+        label.setWindowOpacity(0.96)
+        label.move(int(sprite["x"]), int(sprite["y"]))
+        return sprite
+
+    def create_cat_sprites(self) -> None:
+        if self.cat_sprites or self.root_widget is None:
+            return
+
+        sprite_count = 8
+        for _ in range(sprite_count):
+            sprite = self.build_cat_sprite("foreground")
+            if sprite is not None:
+                self.cat_sprites.append(sprite)
+        self.position_cat_sprites()
+
+    def on_cat_clicked(self, label: QLabel) -> None:
+        if self.root_widget is None:
+            return
+        sprite = next((item for item in self.cat_sprites if item["label"] is label), None)
+        if sprite is None:
+            return
+
+        center = label.geometry().center()
+        PixelExplosion(self.root_widget, center, QColor(sprite["variant"]["fur"]))
+        self.play_kittycat_sound()
+        self.cat_sprites.remove(sprite)
+        label.hide()
+        label.deleteLater()
+
+        if self.cat_mode_enabled:
+            QTimer.singleShot(260, self.spawn_replacement_cat)
+
+    def spawn_replacement_cat(self) -> None:
+        if not self.cat_mode_enabled:
+            return
+        sprite = self.build_cat_sprite()
+        if sprite is None:
+            return
+        self.cat_sprites.append(sprite)
+        self.position_cat_sprites()
+
+    def remove_cat_sprites(self) -> None:
+        for sprite in self.cat_sprites:
+            label = sprite["label"]
+            label.hide()
+            label.deleteLater()
+        self.cat_sprites.clear()
+
+    def create_cat_pixmap(self, size: int, variant: dict) -> QPixmap:
+        pixmap = QPixmap(size, size)
+        pixmap.fill(Qt.GlobalColor.transparent)
+
+        painter = QPainter(pixmap)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        outline = QColor(variant["outline"])
+        face_color = QColor(variant["fur"])
+        inner_ear = QColor(variant["ears"])
+        eye_color = QColor(variant["eyes"])
+        blush_color = QColor(variant["blush"])
+        face_scale = float(variant["face_scale"])
+        ear_height = float(variant["ear_height"])
+        cheek_fluff = float(variant["cheek_fluff"])
+
+        painter.setPen(QPen(outline, max(2, size // 26)))
+        painter.setBrush(face_color)
+        ear_left = QPolygon([
+            QPoint(int(size * 0.24), int(size * 0.36)),
+            QPoint(int(size * 0.38), int(size * ear_height)),
+            QPoint(int(size * 0.5), int(size * 0.34)),
+        ])
+        ear_right = QPolygon([
+            QPoint(int(size * 0.5), int(size * 0.34)),
+            QPoint(int(size * 0.63), int(size * ear_height)),
+            QPoint(int(size * 0.76), int(size * 0.36)),
+        ])
+        painter.drawPolygon(ear_left)
+        painter.drawPolygon(ear_right)
+
+        painter.setBrush(inner_ear)
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.drawPolygon(QPolygon([
+            QPoint(int(size * 0.31), int(size * 0.31)),
+            QPoint(int(size * 0.39), int(size * 0.15)),
+            QPoint(int(size * 0.46), int(size * 0.31)),
+        ]))
+        painter.drawPolygon(QPolygon([
+            QPoint(int(size * 0.54), int(size * 0.31)),
+            QPoint(int(size * 0.61), int(size * 0.15)),
+            QPoint(int(size * 0.69), int(size * 0.31)),
+        ]))
+
+        painter.setPen(QPen(outline, max(2, size // 26)))
+        painter.setBrush(face_color)
+        face_width = int(size * face_scale)
+        face_height = int(size * (0.56 + cheek_fluff))
+        face_x = int((size - face_width) / 2)
+        face_y = int(size * (0.24 - cheek_fluff / 2))
+        painter.drawEllipse(face_x, face_y, face_width, face_height)
+
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(eye_color)
+        painter.drawEllipse(int(size * 0.34), int(size * 0.47), int(size * 0.08), int(size * 0.11))
+        painter.drawEllipse(int(size * 0.58), int(size * 0.47), int(size * 0.08), int(size * 0.11))
+
+        painter.setBrush(blush_color)
+        painter.drawEllipse(int(size * 0.23), int(size * 0.57), int(size * 0.12), int(size * 0.08))
+        painter.drawEllipse(int(size * 0.65), int(size * 0.57), int(size * 0.12), int(size * 0.08))
+
+        painter.setPen(QPen(outline, max(2, size // 30)))
+        painter.drawLine(int(size * 0.5), int(size * 0.53), int(size * 0.46), int(size * 0.59))
+        painter.drawLine(int(size * 0.5), int(size * 0.53), int(size * 0.54), int(size * 0.59))
+        painter.drawLine(int(size * 0.16), int(size * 0.54), int(size * 0.37), int(size * 0.56))
+        painter.drawLine(int(size * 0.16), int(size * 0.62), int(size * 0.37), int(size * 0.59))
+        painter.drawLine(int(size * 0.63), int(size * 0.56), int(size * 0.84), int(size * 0.54))
+        painter.drawLine(int(size * 0.63), int(size * 0.59), int(size * 0.84), int(size * 0.62))
+        painter.end()
+        return pixmap
+
+    def position_cat_sprites(self) -> None:
+        if self.root_widget is None:
+            return
+        width = self.root_widget.width()
+        height = self.root_widget.height()
+        for sprite in self.cat_sprites:
+            label = sprite["label"]
+            size = label.width()
+            x_limit = max(0, width - size)
+            y_limit = max(0, height - size)
+            x = max(0, min(int(sprite["x"]), x_limit))
+            y = max(0, min(int(sprite["y"]), y_limit))
+            label.move(x, y)
+            if sprite["layer"] == "foreground":
+                label.raise_()
+            else:
+                label.lower()
+
+    def tick_cat_sprites(self) -> None:
+        if self.root_widget is None or not self.cat_sprites:
+            return
+
+        width = self.root_widget.width()
+        height = self.root_widget.height()
+        for sprite in self.cat_sprites:
+            label = sprite["label"]
+            size = label.width()
+            x_limit = max(0, width - size)
+            y_limit = max(0, height - size)
+            sprite["phase"] += sprite["phase_step"]
+            sprite["x"] += sprite["dx"]
+            sprite["y"] += sprite["dy"] + (sprite["bob"] if sprite["phase"] % 6.28 < 3.14 else -sprite["bob"])
+
+            if sprite["x"] <= 0 or sprite["x"] >= x_limit:
+                sprite["dx"] *= -1
+                sprite["x"] = max(0, min(sprite["x"], x_limit))
+            if sprite["y"] <= 0 or sprite["y"] >= y_limit:
+                sprite["dy"] *= -1
+                sprite["y"] = max(0, min(sprite["y"], y_limit))
+
+            label.move(int(sprite["x"]), int(sprite["y"]))
+            if sprite["layer"] == "foreground":
+                label.raise_()
+            else:
+                label.lower()
 
     def make_field_label(self, text: str) -> QLabel:
         label = QLabel(text)
         label.setObjectName("fieldLabel")
         return label
 
+    def initialize_log_file(self) -> Path | None:
+        try:
+            log_dir = user_data_dir() / "logs"
+            log_dir.mkdir(parents=True, exist_ok=True)
+            log_path = log_dir / "activity.log"
+            with log_path.open("a", encoding="utf-8") as handle:
+                handle.write(f"\n=== Session started {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} ===\n")
+            return log_path
+        except OSError:
+            return None
+
+    def write_raw_log(self, message: str) -> None:
+        if not self.log_file_path:
+            return
+        try:
+            with self.log_file_path.open("a", encoding="utf-8") as handle:
+                handle.write(f"{message}\n")
+        except OSError:
+            return
+
+    def resizeEvent(self, event) -> None:  # type: ignore[override]
+        super().resizeEvent(event)
+        self.position_cat_sprites()
+
+    def format_activity_message(self, phase: str, text: str) -> str:
+        if self._last_activity_phase == phase:
+            return text
+        self._last_activity_phase = phase
+        return f"\n[{phase}]\n{text}"
+
+    def format_progress_clock(self, value: str) -> str:
+        cleaned = value.strip()
+        if ":" in cleaned:
+            clock_parts = cleaned.split(":")
+            if len(clock_parts) == 3:
+                hours_text, minutes_text, seconds_text = clock_parts
+                try:
+                    hours = int(hours_text)
+                    minutes = int(minutes_text)
+                    seconds = int(float(seconds_text))
+                except ValueError:
+                    return cleaned
+                if hours:
+                    return f"{hours}:{minutes:02d}:{seconds:02d}"
+                return f"{minutes:02d}:{seconds:02d}"
+        try:
+            total_seconds = max(0, int(float(cleaned)))
+        except ValueError:
+            return cleaned
+
+        hours, remainder = divmod(total_seconds, 3600)
+        minutes, seconds = divmod(remainder, 60)
+        if hours:
+            return f"{hours}:{minutes:02d}:{seconds:02d}"
+        return f"{minutes:02d}:{seconds:02d}"
+
+    def simplify_log_message(self, message: str) -> str | None:
+        text = message.strip()
+        if not text:
+            return None
+
+        if text.startswith("Checking for updates: "):
+            return self.format_activity_message("Updates", "Checking for updates...")
+        if text == "You already have the latest version.":
+            return self.format_activity_message("Updates", "App is up to date.")
+        if text.startswith("Auto-fetching info for:"):
+            return self.format_activity_message("Video", "Loading video details...")
+        if text == "Starting metadata lookup...":
+            return None
+        if text.startswith("Fetching info for: "):
+            return None
+        if text == "Starting download worker...":
+            return self.format_activity_message("Download", "Preparing download...")
+        if text == "Starting download...":
+            return None
+        if text.startswith("Downloading URL: "):
+            return None
+        if text.startswith("[youtube] Extracting URL:"):
+            return None
+        if text.startswith("[youtube] ") and ": Downloading webpage" in text:
+            return None
+        if text.startswith("[youtube] ") and ": Downloading android vr player API JSON" in text:
+            return None
+        if text.startswith("[youtube] ") and ": Downloading tv client config" in text:
+            return None
+        if text.startswith("[youtube] ") and ": Downloading tv player API JSON" in text:
+            return None
+        if text.startswith("[youtube] ") and ": Downloading web client config" in text:
+            return None
+        if text.startswith("[youtube] ") and ": Downloading web player API JSON" in text:
+            return None
+        if text.startswith("[youtube] ") and ": Downloading player " in text:
+            return None
+        if text.startswith("[youtube] ") and "Some tv client https formats have been skipped as they are DRM protected." in text:
+            return None
+        if text.startswith("[youtube] [jsc:node] Solving JS challenges using node"):
+            return None
+        if text.startswith("[youtube] [jsc:node] Downloading challenge solver lib script from "):
+            return None
+        if "[jsc] Remote component challenge solver script (node) was skipped." in text:
+            if self._youtube_warning_logged:
+                return None
+            self._youtube_warning_logged = True
+            return None
+        if "n challenge solving failed" in text:
+            if self._youtube_warning_logged:
+                return None
+            self._youtube_warning_logged = True
+            return None
+        if text.startswith("[info] ") and ": Downloading 1 format(s):" in text:
+            return None
+        if text.startswith("[info] ") and ": Downloading 1 time ranges:" in text:
+            return self.format_activity_message("Download", "Cutting the selected clip range...")
+        if text.startswith("[download] Destination: "):
+            destination = text.split(": ", 1)[1].strip()
+            return self.format_activity_message("Download", f"Saving to: {Path(destination).name}")
+        if text.startswith("[download] 100% of "):
+            return None
+        if text == "\x1b[0;31mERROR:\x1b[0m ffmpeg exited with code 1":
+            return None
+        if text.startswith("Download progress: "):
+            progress_match = re.search(r"Download progress: (\d+)% \(([^,]+) / ([^,)]+)", text)
+            if progress_match:
+                percent = progress_match.group(1)
+                elapsed = self.format_progress_clock(progress_match.group(2))
+                total = self.format_progress_clock(progress_match.group(3))
+                return f"Download progress: {percent}% | {elapsed} / {total}"
+            percent_match = re.search(r"Download progress: (\d+)%", text)
+            if percent_match:
+                return f"Download progress: {percent_match.group(1)}%"
+        if text == "Download finished.":
+            return self.format_activity_message("Done", "Download complete.")
+        if text == "Download cancelled by user.":
+            return self.format_activity_message("Done", "Download cancelled.")
+        if text == "Cancelled the current download and removed partial files.":
+            return "Partial download removed."
+        if text == "Looking for yt-dlp and ffmpeg...":
+            return None
+        if text == "Dependencies already available. No setup needed.":
+            return None
+        return text
+
     def append_log(self, message: str) -> None:
-        self.log_output.appendPlainText(message)
+        self.write_raw_log(message)
+        display_message = self.simplify_log_message(message)
+        if display_message is None:
+            return
+        if display_message == self._last_display_log:
+            return
+        self._last_display_log = display_message
+        self.log_output.appendPlainText(display_message)
         self.log_output.verticalScrollBar().setValue(self.log_output.verticalScrollBar().maximum())
 
     def set_status(self, text: str) -> None:
@@ -1113,11 +1985,19 @@ class MainWindow(QMainWindow):
         self.start_input.setDisabled(checked)
         self.end_input.setDisabled(checked)
 
+    def update_clip_range_placeholders(self) -> None:
+        self.start_input.setPlaceholderText("0:00")
+        max_range = format_seconds(self.video_duration) if self.video_duration is not None else "0:00"
+        self.end_input.setPlaceholderText(max_range)
+
     def on_url_changed(self, _: str) -> None:
         self.video_meta.setText("Title: -\nDuration: -")
         self.video_duration = None
         self.video_title = ""
         self.last_fetched_url = ""
+        self._youtube_warning_logged = False
+        self._last_activity_phase = None
+        self.update_clip_range_placeholders()
         if not self.url_input.text().strip():
             self.url_fetch_timer.stop()
             self.update_button_state()
@@ -1173,7 +2053,15 @@ class MainWindow(QMainWindow):
             return
 
         output_dir = Path(self.output_dir_input.text().strip() or DEFAULT_OUTPUT_DIR)
-        output_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            output_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as error:
+            self.show_error(
+                "The selected save folder could not be created.\n\n"
+                f"{output_dir}\n\n"
+                f"{error}"
+            )
+            return
         self.persist_user_settings()
         target_output_path = self.resolve_output_path(output_dir)
         if target_output_path.exists():
@@ -1264,6 +2152,7 @@ class MainWindow(QMainWindow):
         duration = data.get("duration")
         self.video_duration = int(duration) if isinstance(duration, (int, float)) else None
         self.video_meta.setText(f"Title: {title}\nDuration: {format_seconds(self.video_duration)}")
+        self.update_clip_range_placeholders()
         suggested_filename = self.sanitize_filename(title)
         current_filename = self.filename_input.text().strip()
         if not current_filename or current_filename == self.last_auto_filename:
@@ -1387,12 +2276,15 @@ class MainWindow(QMainWindow):
         worker = self.active_worker
         if not self.is_downloading or not isinstance(worker, DownloadWorker):
             return
+        if worker.cancel_requested:
+            return
         self.append_log("Cancelling download...")
         worker.cancel()
 
     def persist_user_settings(self) -> None:
         save_user_settings({
             "output_dir": self.output_dir_input.text().strip() or str(DEFAULT_OUTPUT_DIR),
+            "cat_mode": self.cat_mode_enabled,
         })
 
     def cleanup_cancelled_download(self) -> None:
@@ -1408,9 +2300,18 @@ class MainWindow(QMainWindow):
                 target_path.with_suffix(".f251.webm"),
             ])
             stem = target_path.stem
-            candidates.extend(output_dir.glob(f"{stem}*.part"))
-            candidates.extend(output_dir.glob(f"{stem}*.ytdl"))
-            candidates.extend(output_dir.glob(f"{stem}*.temp"))
+            yt_dlp_temp_name = re.compile(rf"^{re.escape(stem)}\.f\d+\..+")
+            for candidate in output_dir.glob(f"{stem}*"):
+                if candidate == target_path:
+                    continue
+                name = candidate.name
+                if (
+                    ".part" in name
+                    or name.endswith(".ytdl")
+                    or name.endswith(".temp")
+                    or yt_dlp_temp_name.match(name)
+                ):
+                    candidates.append(candidate)
 
         seen: set[Path] = set()
         for candidate in candidates:
