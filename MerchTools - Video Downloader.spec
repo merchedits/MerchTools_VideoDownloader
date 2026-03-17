@@ -18,6 +18,7 @@ project_root = Path(SPEC).resolve().parent
 app_name = "MerchTools - Video Downloader"
 ffmpeg_path = project_root / "ffmpeg.exe"
 node_path = project_root / "node.exe"
+twitch_downloader_path = project_root / "tools" / "TwitchDownloaderCLI" / "TwitchDownloaderCLI.exe"
 certifi_cacert = Path(certifi.where()) if certifi is not None else None
 
 a = Analysis(
@@ -26,6 +27,7 @@ a = Analysis(
     binaries=(
         ([(str(ffmpeg_path), ".")] if ffmpeg_path.exists() else [])
         + ([(str(node_path), ".")] if node_path.exists() else [])
+        + ([(str(twitch_downloader_path), "TwitchDownloaderCLI")] if twitch_downloader_path.exists() else [])
     ),
     datas=[
         (str(project_root / "README.md"), "."),

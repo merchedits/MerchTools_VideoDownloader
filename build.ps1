@@ -18,6 +18,7 @@ $FfmpegTarget = Join-Path $ProjectRoot "ffmpeg.exe"
 $NodeSource = $env:YTDLP_NODE_PATH
 $NodeTarget = Join-Path $ProjectRoot "node.exe"
 $LatestJsonPath = Join-Path $ProjectRoot "latest.json"
+$TwitchDownloaderPath = Join-Path $ProjectRoot "tools\TwitchDownloaderCLI\TwitchDownloaderCLI.exe"
 
 New-Item -ItemType Directory -Force -Path $BuildTempDir | Out-Null
 $env:TMP = $BuildTempDir
@@ -74,6 +75,10 @@ else {
     else {
         Write-Warning "Could not resolve node automatically. Set YTDLP_NODE_PATH to bundle node.exe into the app."
     }
+}
+
+if (-not (Test-Path $TwitchDownloaderPath)) {
+    Write-Warning "TwitchDownloaderCLI.exe was not found at $TwitchDownloaderPath. Twitch VOD range downloads will fall back to the older yt-dlp path in this build."
 }
 
 if (Test-Path $BuildDir) {

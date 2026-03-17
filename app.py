@@ -65,6 +65,7 @@ DEFAULT_OUTPUT_DIR = Path.home() / "Documents" / "MerchTools" / "Video Downloade
 UPDATE_CONFIG_FILENAME = "update_config.json"
 SETTINGS_FILENAME = "user_settings.json"
 NODE_RUNTIME_FILENAME = "node.exe"
+TWITCH_DOWNLOADER_RELATIVE_PATH = Path("TwitchDownloaderCLI") / "TwitchDownloaderCLI.exe"
 DEFAULT_DOWNLOAD_FORMAT = "bestvideo*+bestaudio/best"
 REQUIRED_PYTHON_PACKAGES = [
     ("yt_dlp", "yt-dlp"),
@@ -167,6 +168,16 @@ def bundled_file_candidates(filename: str) -> list[Path]:
     ]
 
 
+def bundled_relative_candidates(relative_path: Path) -> list[Path]:
+    base_dir = application_dir()
+    return [
+        base_dir / relative_path,
+        base_dir / "_internal" / relative_path,
+        Path(__file__).resolve().parent / relative_path,
+        Path(__file__).resolve().parent / "tools" / relative_path,
+    ]
+
+
 def bundled_executable_path(filename: str) -> str | None:
     for candidate in bundled_file_candidates(filename):
         if candidate.exists():
@@ -194,6 +205,30 @@ def yt_dlp_js_runtime_options() -> dict:
             }
         },
     }
+
+
+def is_twitch_url(url: str) -> bool:
+    host = urlparse(url).netloc.lower().replace("www.", "")
+    return host in {"twitch.tv", "m.twitch.tv", "clips.twitch.tv"}
+
+
+def is_twitch_vod_url(url: str) -> bool:
+    parsed = urlparse(url)
+    host = parsed.netloc.lower().replace("www.", "")
+    return host in {"twitch.tv", "m.twitch.tv"} and parsed.path.startswith("/videos/")
+
+
+def is_twitch_clip_url(url: str) -> bool:
+    parsed = urlparse(url)
+    host = parsed.netloc.lower().replace("www.", "")
+    return host == "clips.twitch.tv" or (host in {"twitch.tv", "m.twitch.tv"} and "/clip/" in parsed.path)
+
+
+def resolve_twitch_downloader_executable() -> str | None:
+    for candidate in bundled_relative_candidates(TWITCH_DOWNLOADER_RELATIVE_PATH):
+        if candidate.exists():
+            return str(candidate)
+    return None
 
 
 def user_data_dir() -> Path:
@@ -600,6 +635,7 @@ class InfoWorker(BaseWorker):
     def run(self) -> None:
         self.set_status("Fetching video info...")
         self.log(f"Fetching info for: {self.url}")
+        is_twitch = is_twitch_url(self.url)
 
         for attempt in range(1, 4):
             try:
@@ -614,6 +650,8 @@ class InfoWorker(BaseWorker):
                     "fragment_retries": 10,
                     "logger": YtDlpWorkerLogger(self),
                 }
+                if is_twitch:
+                    options["legacy_ssl_support"] = True
                 options.update(yt_dlp_js_runtime_options())
                 with YoutubeDL(options) as ydl:
                     data = ydl.extract_info(self.url, download=False)
@@ -637,6 +675,7 @@ class DownloadWorker(BaseWorker):
         self,
         url: str,
         output_template: str,
+        output_path: str,
         ffmpeg_path: str,
         expected_duration: int | None = None,
         start_seconds: int | None = None,
@@ -646,6 +685,7 @@ class DownloadWorker(BaseWorker):
         super().__init__()
         self.url = url
         self.output_template = output_template
+        self.output_path = output_path
         self.ffmpeg_path = ffmpeg_path
         self.expected_duration = expected_duration
         self.start_seconds = start_seconds
@@ -661,11 +701,18 @@ class DownloadWorker(BaseWorker):
         self.ffmpeg_progress_span = 100
         self.ffmpeg_progress_duration: float | int | None = expected_duration
         self.ffmpeg_progress_label = "Download progress"
+        self.helper_process = None
 
     def cancel(self) -> None:
         if self.cancel_requested:
             return
         self.cancel_requested = True
+        helper_process = self.helper_process
+        if helper_process is not None and helper_process.poll() is None:
+            try:
+                helper_process.kill()
+            except Exception:  # noqa: BLE001
+                pass
         ffmpeg_process = self.ffmpeg_process
         if ffmpeg_process is not None and ffmpeg_process.poll() is None:
             try:
@@ -730,10 +777,22 @@ class DownloadWorker(BaseWorker):
             return
 
     def run_standard_download(self) -> int:
+        helper_path = resolve_twitch_downloader_executable()
+        if is_twitch_clip_url(self.url) and helper_path:
+            return self.run_twitch_clip_download(helper_path)
+        if (
+            is_twitch_vod_url(self.url)
+            and self.start_seconds is not None
+            and self.end_seconds is not None
+        ):
+            if helper_path:
+                return self.run_twitch_vod_download(helper_path)
+
         self.ffmpeg_progress_base = 0
         self.ffmpeg_progress_span = 100
         self.ffmpeg_progress_duration = self.expected_duration
         self.ffmpeg_progress_label = "Download progress"
+        is_twitch = is_twitch_url(self.url)
 
         options = {
             "quiet": True,
@@ -751,8 +810,13 @@ class DownloadWorker(BaseWorker):
             "progress_hooks": [self.on_progress],
             "logger": YtDlpWorkerLogger(self),
         }
+        if is_twitch:
+            options["legacy_ssl_support"] = True
         options.update(yt_dlp_js_runtime_options())
         options["external_downloader_args"] = {"ffmpeg_o": self.build_ffmpeg_output_args()}
+        ffmpeg_input_args = self.build_ffmpeg_input_args()
+        if ffmpeg_input_args:
+            options["external_downloader_args"]["ffmpeg_i"] = ffmpeg_input_args
         if self.start_seconds is not None and self.end_seconds is not None:
             options["download_ranges"] = download_range_func(None, [(self.start_seconds, self.end_seconds)])
 
@@ -766,8 +830,231 @@ class DownloadWorker(BaseWorker):
         finally:
             yt_dlp_external.Popen = original_popen
             self.ffmpeg_process = None
+            self.helper_process = None
             self.ffmpeg_progress_state = {}
         return code
+
+    def run_twitch_vod_download(self, helper_path: str) -> int:
+        self.ffmpeg_progress_base = 0
+        self.ffmpeg_progress_span = 100
+        self.ffmpeg_progress_duration = self.expected_duration
+        self.ffmpeg_progress_label = "Download progress"
+        self.log("Using Twitch VOD downloader backend.")
+
+        output_path = Path(self.output_path)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+
+        command = [
+            helper_path,
+            "videodownload",
+            "-u", self.url,
+            "-o", str(output_path),
+            "-q", "best",
+            "-b", format_seconds(self.start_seconds),
+            "-e", format_seconds(self.end_seconds),
+            "--trim-mode", "Exact",
+            "--ffmpeg-path", self.ffmpeg_path,
+            "--temp-path", str(user_data_dir() / "temp" / "twitch-downloader"),
+            "--collision", "Overwrite",
+            "--banner", "false",
+            "--log-level", "Status,Info,Warning,Error",
+        ]
+
+        process = subprocess.Popen(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        self.helper_process = process
+
+        try:
+            assert process.stdout is not None
+            for raw_line in process.stdout:
+                if self.cancel_requested:
+                    raise KeyboardInterrupt
+                line = raw_line.strip()
+                if not line:
+                    continue
+                self.on_twitch_downloader_output(line)
+            return process.wait()
+        finally:
+            self.helper_process = None
+
+    def run_twitch_clip_download(self, helper_path: str) -> int:
+        self.ffmpeg_progress_base = 0
+        self.ffmpeg_progress_span = 100
+        self.ffmpeg_progress_duration = self.expected_duration
+        self.ffmpeg_progress_label = "Download progress"
+        self.log("Using Twitch clip downloader backend.")
+
+        output_path = Path(self.output_path)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+
+        if self.start_seconds is None or self.end_seconds is None:
+            return self.run_twitch_clip_helper_download(helper_path, output_path)
+
+        temp_dir = user_data_dir() / "temp" / "twitch-clip"
+        temp_dir.mkdir(parents=True, exist_ok=True)
+        temp_clip = temp_dir / f"{output_path.stem}.source.mp4"
+        if temp_clip.exists():
+            temp_clip.unlink()
+
+        try:
+            code = self.run_twitch_clip_helper_download(helper_path, temp_clip, encode_metadata=False)
+            if code != 0:
+                return code
+            if self.cancel_requested:
+                raise KeyboardInterrupt
+            return self.trim_local_clip(temp_clip, output_path)
+        finally:
+            if temp_clip.exists():
+                try:
+                    temp_clip.unlink()
+                except OSError:
+                    pass
+
+    def run_twitch_clip_helper_download(self, helper_path: str, destination: Path, encode_metadata: bool = True) -> int:
+        command = [
+            helper_path,
+            "clipdownload",
+            "-u", self.url,
+            "-o", str(destination),
+            "-q", "best",
+            "--ffmpeg-path", self.ffmpeg_path,
+            "--temp-path", str(user_data_dir() / "temp" / "twitch-downloader"),
+            "--encode-metadata", str(encode_metadata).lower(),
+            "--collision", "Overwrite",
+            "--banner", "false",
+            "--log-level", "Status,Info,Warning,Error",
+        ]
+
+        process = subprocess.Popen(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        self.helper_process = process
+        try:
+            assert process.stdout is not None
+            for raw_line in process.stdout:
+                if self.cancel_requested:
+                    raise KeyboardInterrupt
+                line = raw_line.strip()
+                if not line:
+                    continue
+                self.on_twitch_downloader_output(line)
+            return process.wait()
+        finally:
+            self.helper_process = None
+
+    def trim_local_clip(self, source_path: Path, output_path: Path) -> int:
+        trim_duration = self.end_seconds - self.start_seconds
+        self.ffmpeg_progress_state = {}
+        self.last_progress_percent = -1
+        self.last_progress_log_time = 0.0
+        self.ffmpeg_progress_base = 75
+        self.ffmpeg_progress_span = 25
+        self.ffmpeg_progress_duration = trim_duration
+        self.ffmpeg_progress_label = "Download progress"
+
+        command = [
+            self.ffmpeg_path,
+            "-y",
+            "-hide_banner",
+            "-loglevel", "error",
+            "-i", str(source_path),
+            "-ss", str(self.start_seconds),
+            "-t", str(trim_duration),
+            *self.build_ffmpeg_output_args(),
+            str(output_path),
+        ]
+
+        process = subprocess.Popen(
+            command,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        self.ffmpeg_process = process
+        try:
+            assert process.stderr is not None
+            for raw_line in process.stderr:
+                if self.cancel_requested:
+                    raise KeyboardInterrupt
+                line = raw_line.strip()
+                if line:
+                    self.on_ffmpeg_output(line)
+            return process.wait()
+        finally:
+            self.ffmpeg_process = None
+
+    def on_twitch_downloader_output(self, line: str) -> None:
+        status_match = re.search(r"\[STATUS\] - (?P<label>.+?) (?P<percent>\d+)% \[(?P<step>\d+)/(?P<total>\d+)\]", line)
+        if status_match:
+            label = status_match.group("label").strip()
+            percent = int(status_match.group("percent"))
+            step = int(status_match.group("step"))
+            total = int(status_match.group("total"))
+
+            stage_progress = self.map_helper_stage_progress(step, total, percent)
+            self.signals.progress.emit(stage_progress)
+            self.log_helper_progress(stage_progress, label)
+            return
+
+        clip_match = re.search(r"\[STATUS\] - (?P<label>.+?) (?P<percent>\d+)%$", line)
+        if clip_match:
+            label = clip_match.group("label").strip()
+            percent = int(clip_match.group("percent"))
+            stage_progress = self.map_clip_helper_progress(label, percent)
+            self.signals.progress.emit(stage_progress)
+            self.log_helper_progress(stage_progress, label)
+            return
+
+        if line == "[STATUS] - Fetching Clip Info":
+            self.signals.progress.emit(0)
+            return
+
+        if line.startswith("[ERROR]"):
+            raise DownloadError(line)
+
+        if line.startswith("[WARNING]"):
+            self.log(line)
+
+    def map_helper_stage_progress(self, step: int, total: int, percent: int) -> int:
+        if total <= 0:
+            return max(0, min(100, percent))
+
+        stage_start = int(((step - 1) / total) * 100)
+        stage_end = int((step / total) * 100)
+        mapped = stage_start + round((stage_end - stage_start) * (percent / 100))
+        return max(0, min(100, mapped))
+
+    def map_clip_helper_progress(self, label: str, percent: int) -> int:
+        normalized = label.lower()
+        if "downloading clip" in normalized:
+            return max(0, min(75, round(percent * 0.75)))
+        if "encoding clip metadata" in normalized:
+            return 75 + max(0, min(25, round(percent * 0.25)))
+        return max(0, min(100, percent))
+
+    def log_helper_progress(self, percentage: int, label: str) -> None:
+        now = time.time()
+        if percentage == self.last_progress_percent and (now - self.last_progress_log_time) < 0.75:
+            return
+        self.last_progress_percent = percentage
+        self.last_progress_log_time = now
+        self.log(f"Download progress: {percentage}% | {label}")
 
     def build_ffmpeg_output_args(self) -> list[str]:
         args = ["-progress", "pipe:2", "-nostats"]
@@ -787,6 +1074,20 @@ class DownloadWorker(BaseWorker):
 
         self.log("Hardware acceleration: no supported GPU encoder found. Falling back to CPU encoding.")
         return args
+
+    def build_ffmpeg_input_args(self) -> list[str]:
+        if not is_twitch_url(self.url):
+            return []
+
+        # Twitch VOD HLS requests can silently hang before media starts flowing.
+        # These flags make ffmpeg reconnect and fail faster instead of waiting forever.
+        return [
+            "-reconnect", "1",
+            "-reconnect_streamed", "1",
+            "-reconnect_delay_max", "5",
+            "-rw_timeout", "15000000",
+            "-http_persistent", "0",
+        ]
 
     def make_tracking_popen(self, base_popen):
         worker = self
@@ -1254,7 +1555,6 @@ class MainWindow(QMainWindow):
         self.update_config = load_update_config()
         self.user_settings = load_user_settings()
         self.cat_mode_enabled = bool(self.user_settings.get("cat_mode"))
-        self.hardware_acceleration_enabled = self.user_settings.get("hardware_acceleration", True) is not False
         self.last_fetched_url = ""
         self.last_output_path: Path | None = None
         self.log_file_path = self.initialize_log_file()
@@ -1399,12 +1699,6 @@ class MainWindow(QMainWindow):
         self.reveal_checkbox.setObjectName("optionToggle")
         self.reveal_checkbox.setChecked(True)
         clip_card.content_layout.addWidget(self.reveal_checkbox)
-
-        self.hardware_acceleration_checkbox = QCheckBox("Use hardware acceleration")
-        self.hardware_acceleration_checkbox.setObjectName("optionToggle")
-        self.hardware_acceleration_checkbox.setChecked(self.hardware_acceleration_enabled)
-        self.hardware_acceleration_checkbox.toggled.connect(self.on_hardware_acceleration_toggled)
-        clip_card.content_layout.addWidget(self.hardware_acceleration_checkbox)
 
         self.cat_checkbox = QCheckBox("Kittycat")
         self.cat_checkbox.setObjectName("optionToggle")
@@ -1599,10 +1893,6 @@ class MainWindow(QMainWindow):
 
     def on_cat_mode_toggled(self, checked: bool) -> None:
         self.apply_cat_mode(checked)
-        self.persist_user_settings()
-
-    def on_hardware_acceleration_toggled(self, checked: bool) -> None:
-        self.hardware_acceleration_enabled = checked
         self.persist_user_settings()
 
     def apply_cat_mode(self, enabled: bool) -> None:
@@ -2270,11 +2560,12 @@ class MainWindow(QMainWindow):
         worker = DownloadWorker(
             url=url,
             output_template=self.build_output_template(output_dir),
+            output_path=str(target_output_path),
             ffmpeg_path=ffmpeg_path,
             expected_duration=expected_duration,
             start_seconds=start_seconds,
             end_seconds=end_seconds,
-            use_hardware_acceleration=self.hardware_acceleration_enabled,
+            use_hardware_acceleration=True,
         )
         self.run_worker(
             worker,
@@ -2429,7 +2720,6 @@ class MainWindow(QMainWindow):
         save_user_settings({
             "output_dir": self.output_dir_input.text().strip() or str(DEFAULT_OUTPUT_DIR),
             "cat_mode": self.cat_mode_enabled,
-            "hardware_acceleration": self.hardware_acceleration_enabled,
         })
 
     def cleanup_cancelled_download(self) -> None:
