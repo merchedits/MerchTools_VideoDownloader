@@ -3,7 +3,10 @@
 from pathlib import Path
 
 try:
-    import certifi
+    import certifi as _certifi
+    if not hasattr(_certifi, "where"):
+        raise ImportError
+    certifi = _certifi
 except ImportError:
     try:
         from pip._vendor import certifi
@@ -29,8 +32,8 @@ a = Analysis(
         (str(project_root / "assets" / "app-icon.png"), "assets"),
         (str(project_root / "update_config.json"), "."),
         (str(project_root / "latest.example.json"), "."),
-    ] + ([(str(certifi_cacert), "certifi")] if certifi_cacert and certifi_cacert.exists() else []),
-    hiddenimports=['yt_dlp', 'imageio_ffmpeg'],
+    ] + ([(str(certifi_cacert), "pip/_vendor/certifi")] if certifi_cacert and certifi_cacert.exists() else []),
+    hiddenimports=['yt_dlp', 'imageio_ffmpeg', 'pip._vendor.certifi'],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],

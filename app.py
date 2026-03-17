@@ -20,10 +20,14 @@ from urllib.parse import parse_qs, urlparse
 from urllib.request import Request, urlopen
 
 try:
-    import certifi
+    import certifi as _certifi
+    if not hasattr(_certifi, "where"):
+        raise ImportError
+    certifi = _certifi
 except ImportError:
     try:
         from pip._vendor import certifi  # type: ignore[no-redef]
+        sys.modules["certifi"] = certifi
     except ImportError:
         certifi = None
 
