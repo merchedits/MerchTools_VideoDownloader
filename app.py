@@ -63,6 +63,7 @@ REQUIRED_PYTHON_PACKAGES = [
     ("yt_dlp", "yt-dlp"),
     ("imageio_ffmpeg", "imageio-ffmpeg"),
 ]
+HARDWARE_ENCODER_CACHE: dict[str, str | None] = {}
 
 
 def format_seconds(total_seconds: float | int | None) -> str:
@@ -255,6 +256,73 @@ def subprocess_window_options() -> dict:
         "creationflags": subprocess.CREATE_NO_WINDOW,
         "startupinfo": startupinfo,
     }
+
+
+def detect_windows_gpu_names() -> list[str]:
+    if os.name != "nt":
+        return []
+    command = [
+        "powershell",
+        "-NoProfile",
+        "-Command",
+        "Get-CimInstance Win32_VideoController | Select-Object -ExpandProperty Name",
+    ]
+    try:
+        result = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            timeout=6,
+            **subprocess_window_options(),
+        )
+    except Exception:  # noqa: BLE001
+        return []
+    if result.returncode != 0:
+        return []
+    return [line.strip() for line in result.stdout.splitlines() if line.strip()]
+
+
+def detect_hardware_encoder(ffmpeg_path: str) -> str | None:
+    cached = HARDWARE_ENCODER_CACHE.get(ffmpeg_path)
+    if ffmpeg_path in HARDWARE_ENCODER_CACHE:
+        return cached
+
+    try:
+        result = subprocess.run(
+            [ffmpeg_path, "-hide_banner", "-encoders"],
+            capture_output=True,
+            text=True,
+            timeout=8,
+            **subprocess_window_options(),
+        )
+    except Exception:  # noqa: BLE001
+        HARDWARE_ENCODER_CACHE[ffmpeg_path] = None
+        return None
+
+    encoders_output = f"{result.stdout}\n{result.stderr}".lower()
+    gpu_names = " ".join(detect_windows_gpu_names()).lower()
+
+    encoder: str | None = None
+    if "nvidia" in gpu_names or "geforce" in gpu_names or "rtx" in gpu_names or "gtx" in gpu_names:
+        if "h264_nvenc" in encoders_output:
+            encoder = "h264_nvenc"
+    elif "amd" in gpu_names or "radeon" in gpu_names:
+        if "h264_amf" in encoders_output:
+            encoder = "h264_amf"
+    elif "intel" in gpu_names:
+        if "h264_qsv" in encoders_output:
+            encoder = "h264_qsv"
+
+    if encoder is None:
+        if "h264_nvenc" in encoders_output:
+            encoder = "h264_nvenc"
+        elif "h264_amf" in encoders_output:
+            encoder = "h264_amf"
+        elif "h264_qsv" in encoders_output:
+            encoder = "h264_qsv"
+
+    HARDWARE_ENCODER_CACHE[ffmpeg_path] = encoder
+    return encoder
 
 
 def version_key(value: str) -> tuple[int, ...]:
@@ -548,6 +616,7 @@ class DownloadWorker(BaseWorker):
         expected_duration: int | None = None,
         start_seconds: int | None = None,
         end_seconds: int | None = None,
+        use_hardware_acceleration: bool = False,
     ) -> None:
         super().__init__()
         self.url = url
@@ -556,6 +625,7 @@ class DownloadWorker(BaseWorker):
         self.expected_duration = expected_duration
         self.start_seconds = start_seconds
         self.end_seconds = end_seconds
+        self.use_hardware_acceleration = use_hardware_acceleration
         self.cancel_requested = False
         self.ydl: YoutubeDL | None = None
         self.ffmpeg_process = None
@@ -657,7 +727,7 @@ class DownloadWorker(BaseWorker):
             "logger": YtDlpWorkerLogger(self),
         }
         options.update(yt_dlp_js_runtime_options())
-        options["external_downloader_args"] = {"ffmpeg_o": ["-progress", "pipe:2", "-nostats"]}
+        options["external_downloader_args"] = {"ffmpeg_o": self.build_ffmpeg_output_args()}
         if self.start_seconds is not None and self.end_seconds is not None:
             options["download_ranges"] = download_range_func(None, [(self.start_seconds, self.end_seconds)])
 
@@ -673,6 +743,25 @@ class DownloadWorker(BaseWorker):
             self.ffmpeg_process = None
             self.ffmpeg_progress_state = {}
         return code
+
+    def build_ffmpeg_output_args(self) -> list[str]:
+        args = ["-progress", "pipe:2", "-nostats"]
+        if self.start_seconds is None or self.end_seconds is None or not self.use_hardware_acceleration:
+            return args
+
+        encoder = detect_hardware_encoder(self.ffmpeg_path)
+        if encoder == "h264_nvenc":
+            self.log("Hardware acceleration: using NVIDIA NVENC for clip encoding.")
+            return args + ["-c:v", "h264_nvenc", "-preset", "p4", "-cq", "19", "-b:v", "0", "-c:a", "aac", "-b:a", "192k"]
+        if encoder == "h264_amf":
+            self.log("Hardware acceleration: using AMD AMF for clip encoding.")
+            return args + ["-c:v", "h264_amf", "-quality", "quality", "-rc", "cqp", "-qp_i", "19", "-qp_p", "21", "-qp_b", "23", "-c:a", "aac", "-b:a", "192k"]
+        if encoder == "h264_qsv":
+            self.log("Hardware acceleration: using Intel Quick Sync for clip encoding.")
+            return args + ["-c:v", "h264_qsv", "-global_quality", "21", "-look_ahead", "0", "-c:a", "aac", "-b:a", "192k"]
+
+        self.log("Hardware acceleration: no supported GPU encoder found. Falling back to CPU encoding.")
+        return args
 
     def make_tracking_popen(self, base_popen):
         worker = self
@@ -1140,6 +1229,7 @@ class MainWindow(QMainWindow):
         self.update_config = load_update_config()
         self.user_settings = load_user_settings()
         self.cat_mode_enabled = bool(self.user_settings.get("cat_mode"))
+        self.hardware_acceleration_enabled = self.user_settings.get("hardware_acceleration", True) is not False
         self.last_fetched_url = ""
         self.last_output_path: Path | None = None
         self.log_file_path = self.initialize_log_file()
@@ -1284,6 +1374,12 @@ class MainWindow(QMainWindow):
         self.reveal_checkbox.setObjectName("optionToggle")
         self.reveal_checkbox.setChecked(True)
         clip_card.content_layout.addWidget(self.reveal_checkbox)
+
+        self.hardware_acceleration_checkbox = QCheckBox("Use hardware acceleration")
+        self.hardware_acceleration_checkbox.setObjectName("optionToggle")
+        self.hardware_acceleration_checkbox.setChecked(self.hardware_acceleration_enabled)
+        self.hardware_acceleration_checkbox.toggled.connect(self.on_hardware_acceleration_toggled)
+        clip_card.content_layout.addWidget(self.hardware_acceleration_checkbox)
 
         self.cat_checkbox = QCheckBox("Kittycat")
         self.cat_checkbox.setObjectName("optionToggle")
@@ -1478,6 +1574,10 @@ class MainWindow(QMainWindow):
 
     def on_cat_mode_toggled(self, checked: bool) -> None:
         self.apply_cat_mode(checked)
+        self.persist_user_settings()
+
+    def on_hardware_acceleration_toggled(self, checked: bool) -> None:
+        self.hardware_acceleration_enabled = checked
         self.persist_user_settings()
 
     def apply_cat_mode(self, enabled: bool) -> None:
@@ -1859,6 +1959,8 @@ class MainWindow(QMainWindow):
             return self.format_activity_message("Updates", "Checking for updates...")
         if text == "You already have the latest version.":
             return self.format_activity_message("Updates", "App is up to date.")
+        if text in {"Cat mode enabled.", "Cat mode disabled."}:
+            return None
         if text.startswith("Auto-fetching info for:"):
             return self.format_activity_message("Video", "Loading video details...")
         if text == "Starting metadata lookup...":
@@ -1872,6 +1974,8 @@ class MainWindow(QMainWindow):
         if text.startswith("Downloading URL: "):
             return None
         if text.startswith("[youtube] Extracting URL:"):
+            return None
+        if text.startswith("[youtube] [WinError 10054]"):
             return None
         if text.startswith("[youtube] ") and ": Downloading webpage" in text:
             return None
@@ -1893,10 +1997,18 @@ class MainWindow(QMainWindow):
             return None
         if text.startswith("[youtube] [jsc:node] Downloading challenge solver lib script from "):
             return None
+        if text.startswith("[youtube] [jsc:node] Downloading challenge solver core script from "):
+            return None
         if "[jsc] Remote component challenge solver script (node) was skipped." in text:
             if self._youtube_warning_logged:
                 return None
             self._youtube_warning_logged = True
+            return None
+        if text.startswith("Hardware acceleration: "):
+            return None
+        if text.startswith("Twitch metadata request dropped. Retrying"):
+            return None
+        if text.startswith("Twitch request dropped. Retrying download"):
             return None
         if "n challenge solving failed" in text:
             if self._youtube_warning_logged:
@@ -2131,6 +2243,7 @@ class MainWindow(QMainWindow):
             expected_duration=expected_duration,
             start_seconds=start_seconds,
             end_seconds=end_seconds,
+            use_hardware_acceleration=self.hardware_acceleration_enabled,
         )
         self.run_worker(
             worker,
@@ -2285,6 +2398,7 @@ class MainWindow(QMainWindow):
         save_user_settings({
             "output_dir": self.output_dir_input.text().strip() or str(DEFAULT_OUTPUT_DIR),
             "cat_mode": self.cat_mode_enabled,
+            "hardware_acceleration": self.hardware_acceleration_enabled,
         })
 
     def cleanup_cancelled_download(self) -> None:
