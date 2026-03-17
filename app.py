@@ -246,6 +246,24 @@ def urlopen_options() -> dict:
     return {"context": ssl.create_default_context(cafile=certifi.where())}
 
 
+def configure_ssl_environment() -> None:
+    if certifi is None:
+        return
+
+    try:
+        ca_bundle = certifi.where()
+    except Exception:  # noqa: BLE001
+        return
+
+    if not ca_bundle or not Path(ca_bundle).exists():
+        return
+
+    # Make bundled CA certificates visible to yt-dlp and its HTTP backends.
+    os.environ["SSL_CERT_FILE"] = ca_bundle
+    os.environ["REQUESTS_CA_BUNDLE"] = ca_bundle
+    os.environ["CURL_CA_BUNDLE"] = ca_bundle
+
+
 def subprocess_window_options() -> dict:
     if os.name != "nt":
         return {}
@@ -2678,6 +2696,7 @@ class MainWindow(QMainWindow):
 
 
 def main() -> None:
+    configure_ssl_environment()
     app = QApplication(sys.argv)
     window = MainWindow()
     window.show()
