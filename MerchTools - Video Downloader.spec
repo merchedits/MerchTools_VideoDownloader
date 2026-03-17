@@ -2,11 +2,20 @@
 
 from pathlib import Path
 
+try:
+    import certifi
+except ImportError:
+    try:
+        from pip._vendor import certifi
+    except ImportError:
+        certifi = None
+
 
 project_root = Path(SPEC).resolve().parent
 app_name = "MerchTools - Video Downloader"
 ffmpeg_path = project_root / "ffmpeg.exe"
 node_path = project_root / "node.exe"
+certifi_cacert = Path(certifi.where()) if certifi is not None else None
 
 a = Analysis(
     [str(project_root / "app.py")],
@@ -20,7 +29,7 @@ a = Analysis(
         (str(project_root / "assets" / "app-icon.png"), "assets"),
         (str(project_root / "update_config.json"), "."),
         (str(project_root / "latest.example.json"), "."),
-    ],
+    ] + ([(str(certifi_cacert), "certifi")] if certifi_cacert and certifi_cacert.exists() else []),
     hiddenimports=['yt_dlp', 'imageio_ffmpeg'],
     hookspath=[],
     hooksconfig={},

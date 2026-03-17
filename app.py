@@ -22,7 +22,10 @@ from urllib.request import Request, urlopen
 try:
     import certifi
 except ImportError:
-    certifi = None
+    try:
+        from pip._vendor import certifi  # type: ignore[no-redef]
+    except ImportError:
+        certifi = None
 
 from yt_dlp import YoutubeDL
 from yt_dlp.utils import DownloadError, download_range_func
