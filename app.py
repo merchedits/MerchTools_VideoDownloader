@@ -183,7 +183,7 @@ def yt_dlp_js_runtime_options() -> dict:
         "remote_components": ["ejs:github"],
         "extractor_args": {
             "youtube": {
-                "player_client": ["tv", "android_vr", "web"],
+                "player_client": ["web", "android_vr"],
             }
         },
     }
@@ -1998,6 +1998,12 @@ class MainWindow(QMainWindow):
         if text.startswith("[youtube] [jsc:node] Downloading challenge solver lib script from "):
             return None
         if text.startswith("[youtube] [jsc:node] Downloading challenge solver core script from "):
+            return None
+        if text.startswith("[youtube] [jsc] Error solving n challenge request using "):
+            return None
+        if text.startswith("input = NChallengeInput("):
+            return None
+        if text.startswith("Please report this issue on "):
             return None
         if "[jsc] Remote component challenge solver script (node) was skipped." in text:
             if self._youtube_warning_logged:
