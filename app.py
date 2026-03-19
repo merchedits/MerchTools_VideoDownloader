@@ -1,3 +1,4 @@
+import html
 import importlib
 import json
 import math
@@ -13,6 +14,7 @@ import tempfile
 import threading
 import time
 import wave
+import ctypes
 from datetime import datetime
 from pathlib import Path
 from urllib.error import HTTPError, URLError
@@ -34,13 +36,15 @@ except ImportError:
 from yt_dlp import YoutubeDL
 from yt_dlp.utils import DownloadError, download_range_func
 from yt_dlp.downloader import external as yt_dlp_external
-from PySide6.QtCore import QObject, QPoint, QThread, Qt, Signal, QTimer
+from PySide6.QtCore import QObject, QPoint, QEvent, QThread, Qt, Signal, QTimer
 from PySide6.QtGui import QColor, QFont, QIcon, QPainter, QPen, QPixmap, QPolygon
 from PySide6.QtWidgets import (
     QApplication,
+    QBoxLayout,
     QCheckBox,
     QFileDialog,
     QFrame,
+    QGraphicsOpacityEffect,
     QGridLayout,
     QHBoxLayout,
     QLabel,
@@ -48,8 +52,8 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QMessageBox,
     QPushButton,
-    QPlainTextEdit,
     QSizePolicy,
+    QTextEdit,
     QVBoxLayout,
     QWidget,
 )
@@ -72,6 +76,11 @@ REQUIRED_PYTHON_PACKAGES = [
     ("imageio_ffmpeg", "imageio-ffmpeg"),
 ]
 HARDWARE_ENCODER_CACHE: dict[str, str | None] = {}
+
+IS_WINDOWS = sys.platform.startswith("win")
+WM_SYSCOMMAND = 0x0112
+SC_RESTORE = 0xF120
+SC_MAXIMIZE = 0xF030
 
 
 def format_seconds(total_seconds: float | int | None) -> str:
@@ -476,48 +485,111 @@ class ProgressButton(QPushButton):
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
 
         rect = self.rect().adjusted(0, 0, -1, -1)
-        radius = 12
+        radius = 0
         if self.isEnabled() and not self._show_progress:
-            bg = QColor("#ff9a55") if not self._hover_primary else QColor("#ffae73")
-            border = QColor("#ffb883") if self._hover_primary else QColor("#ff9a55")
+            bg = QColor(192, 255, 51, 24) if not self._hover_primary else QColor("#c0ff33")
+            border = QColor("#c0ff33") if self._hover_primary else QColor("#333333")
         else:
-            bg = QColor("#1b1f23") if self.isEnabled() else QColor("#171a1d")
-            border = QColor("#2a2e33") if self.isEnabled() else QColor("#22262a")
-        text_color = QColor("#efe8dd") if self.isEnabled() else QColor("#7d766d")
+            bg = QColor("#161616") if self.isEnabled() else QColor("#111111")
+            border = QColor("#2e2e2e") if self.isEnabled() else QColor("#1e1e1e")
+        text_color = QColor("#c0ff33") if self.isEnabled() and not self._hover_primary else QColor("#090909")
+        if not self.isEnabled():
+            text_color = QColor("#4a4a4a")
         progress_active = self._show_progress and not self._hover_cancel
 
         painter.setPen(QPen(border, 1))
         painter.setBrush(bg)
-        painter.drawRoundedRect(rect, radius, radius)
+        painter.drawRect(rect)
 
         if self._show_progress and not self._hover_cancel:
-            text_color = QColor("#1a1613")
+            text_color = QColor("#ebebeb")
         if self._hover_cancel and self._show_progress:
-            painter.setPen(QPen(QColor("#cb4b4b"), 1))
-            painter.setBrush(QColor("#7a2020"))
-            painter.drawRoundedRect(rect, radius, radius)
+            painter.setPen(QPen(QColor("#ff4444"), 1))
+            painter.setBrush(QColor("#291010"))
+            painter.drawRect(rect)
             text_color = QColor("#fff2f2")
         elif self._show_progress:
-            border = QColor("#ff9a55")
-            text_color = QColor("#efe8dd")
+            border = QColor("#c0ff33")
+            text_color = QColor("#ebebeb")
         if progress_active and self._progress > 0:
             painter.setPen(Qt.PenStyle.NoPen)
-            painter.setBrush(QColor("#ff9a55"))
+            painter.setBrush(QColor("#c0ff33"))
             painter.setClipRect(rect)
             progress_rect = rect.adjusted(0, 0, -(rect.width() - int((rect.width() * self._progress) / 100)), 0)
-            painter.drawRoundedRect(progress_rect, radius, radius)
+            painter.drawRect(progress_rect)
             painter.setClipping(False)
             painter.setPen(QPen(border, 1))
             painter.setBrush(Qt.BrushStyle.NoBrush)
-            painter.drawRoundedRect(rect, radius, radius)
+            painter.drawRect(rect)
 
-        painter.setPen(text_color)
         text = self.text()
         if self._hover_cancel and self._show_progress:
-            text = "Cancel Download"
+            text = "CANCEL DOWNLOAD"
         elif self._show_progress:
-            text = f"Downloading... {self._progress}%"
-        painter.drawText(rect, Qt.AlignmentFlag.AlignCenter, text)
+            text = f"DOWNLOADING {self._progress}%"
+        if progress_active and self._progress > 0:
+            progress_width = int((rect.width() * self._progress) / 100)
+            progress_rect = rect.adjusted(0, 0, -(rect.width() - progress_width), 0)
+
+            painter.save()
+            painter.setClipRect(progress_rect)
+            painter.setPen(QColor("#090909"))
+            painter.drawText(rect, Qt.AlignmentFlag.AlignCenter, text)
+            painter.restore()
+
+            if progress_width < rect.width():
+                remaining_rect = rect.adjusted(progress_width, 0, 0, 0)
+                painter.save()
+                painter.setClipRect(remaining_rect)
+                painter.setPen(QColor("#ebebeb"))
+                painter.drawText(rect, Qt.AlignmentFlag.AlignCenter, text)
+                painter.restore()
+        else:
+            painter.setPen(text_color)
+            painter.drawText(rect, Qt.AlignmentFlag.AlignCenter, text)
+
+
+class IndustrialCheckBox(QCheckBox):
+    def __init__(self, text: str, parent: QWidget | None = None) -> None:
+        super().__init__(text, parent)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setMinimumHeight(30)
+
+    def paintEvent(self, event) -> None:  # type: ignore[override]
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, False)
+
+        rect = self.rect()
+        hovered = self.underMouse()
+        box = rect.adjusted(0, 7, -(rect.width() - 16), -7)
+        box.setWidth(16)
+        box.setHeight(16)
+
+        border = QColor("#333333")
+        fill = QColor("#090909")
+        if hovered:
+            border = QColor("#c0ff33")
+        if self.isChecked():
+            border = QColor("#c0ff33")
+            fill = QColor(192, 255, 51, 22)
+
+        painter.setPen(QPen(border, 1))
+        painter.setBrush(fill)
+        painter.drawRect(box)
+
+        if self.isChecked():
+            painter.setPen(QPen(QColor("#c0ff33"), 1))
+            mid_y = box.center().y()
+            painter.drawLine(box.left() + 3, mid_y, box.left() + 6, box.bottom() - 3)
+            painter.drawLine(box.left() + 6, box.bottom() - 3, box.right() - 3, box.top() + 3)
+
+        text_rect = rect.adjusted(28, 0, -8, 0)
+        text_color = QColor("#ebebeb") if self.isChecked() else QColor("#8f8f8f")
+        if hovered:
+            text_color = QColor("#ebebeb")
+        painter.setPen(text_color)
+        painter.setFont(self.font())
+        painter.drawText(text_rect, Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, self.text())
 
 
 class DependencyWorker(BaseWorker):
@@ -1411,15 +1483,31 @@ class CardFrame(QFrame):
         super().__init__(parent)
         self.setObjectName("card")
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(18, 18, 18, 18)
+        layout.setContentsMargins(24, 14, 24, 24)
         layout.setSpacing(14)
+
+        accent_line = QFrame()
+        accent_line.setObjectName("cardAccentLine")
+        accent_line.setFixedHeight(1)
+        layout.addWidget(accent_line)
+
+        title_row = QHBoxLayout()
+        title_row.setContentsMargins(0, 0, 0, 0)
+        title_row.setSpacing(10)
+        layout.addLayout(title_row)
+
+        title_dot = QFrame()
+        title_dot.setObjectName("cardTitleDot")
+        title_dot.setFixedSize(6, 6)
+        title_row.addWidget(title_dot, 0, Qt.AlignmentFlag.AlignVCenter)
 
         title_label = QLabel(title)
         title_label.setObjectName("cardTitle")
-        layout.addWidget(title_label)
+        title_row.addWidget(title_label)
+        title_row.addStretch(1)
 
         self.content_layout = QVBoxLayout()
-        self.content_layout.setSpacing(12)
+        self.content_layout.setSpacing(14)
         layout.addLayout(self.content_layout)
 
 
@@ -1530,12 +1618,179 @@ class PixelExplosion(QWidget):
             )
 
 
+class IndustrialCursorOverlay(QWidget):
+    def __init__(self, parent: QWidget) -> None:
+        super().__init__(parent)
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        self.target = QPoint(parent.width() // 2, parent.height() // 2)
+        self.ring = QPoint(self.target)
+        self.hover = False
+        self.visible_cursor = True
+        self.resize(parent.size())
+        self.timer = QTimer(self)
+        self.timer.setInterval(16)
+        self.timer.timeout.connect(self.animate)
+        self.timer.start()
+        self.show()
+
+    def set_target(self, position: QPoint) -> None:
+        self.target = position
+        self.visible_cursor = True
+        self.update()
+
+    def set_hover(self, hovered: bool) -> None:
+        if self.hover == hovered:
+            return
+        self.hover = hovered
+        self.update()
+
+    def animate(self) -> None:
+        dx = self.target.x() - self.ring.x()
+        dy = self.target.y() - self.ring.y()
+        if abs(dx) < 1 and abs(dy) < 1:
+            self.raise_()
+            return
+        self.ring.setX(int(self.ring.x() + dx * 0.18))
+        self.ring.setY(int(self.ring.y() + dy * 0.18))
+        self.raise_()
+        self.update()
+
+    def paintEvent(self, event) -> None:  # type: ignore[override]
+        if not self.visible_cursor:
+            return
+
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+
+        ring_radius = 14 if not self.hover else 7
+        ring_color = QColor(192, 255, 51, 76)
+        if not self.hover:
+            painter.setPen(QPen(ring_color, 1))
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.drawEllipse(self.ring, ring_radius, ring_radius)
+
+        dot_size = 5 if not self.hover else 16
+        dot_rect = (
+            self.target.x() - dot_size // 2,
+            self.target.y() - dot_size // 2,
+            dot_size,
+            dot_size,
+        )
+        if self.hover:
+            painter.setPen(QPen(QColor("#c0ff33"), 1))
+            painter.setBrush(QColor(192, 255, 51, 45))
+            painter.drawEllipse(*dot_rect)
+        else:
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(QColor("#c0ff33"))
+            painter.drawEllipse(*dot_rect)
+
+
+class WindowTitleBar(QFrame):
+    def __init__(self, window: "MainWindow") -> None:
+        super().__init__(window)
+        self.window = window
+        self.setObjectName("titleBar")
+        self._drag_offset: QPoint | None = None
+
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(20, 0, 0, 0)
+        layout.setSpacing(12)
+
+        self.toggle_button = QPushButton("▲")
+        self.toggle_button.setObjectName("titleBarToggle")
+        self.toggle_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.toggle_button.clicked.connect(self.window.toggle_kittycat_menu)
+        layout.addWidget(self.toggle_button, 0, Qt.AlignmentFlag.AlignVCenter)
+
+        brand = QLabel("MERCHTOOLS")
+        brand.setObjectName("titleBarBrand")
+        layout.addWidget(brand, 0, Qt.AlignmentFlag.AlignVCenter)
+
+        separator = QFrame()
+        separator.setObjectName("titleBarSeparator")
+        separator.setFixedSize(1, 16)
+        layout.addWidget(separator, 0, Qt.AlignmentFlag.AlignVCenter)
+
+        title = QLabel("Video Downloader")
+        title.setObjectName("titleBarTitle")
+        layout.addWidget(title, 0, Qt.AlignmentFlag.AlignVCenter)
+        layout.addStretch(1)
+
+        self.minimize_button = QPushButton("—")
+        self.minimize_button.setObjectName("titleBarButton")
+        self.minimize_button.clicked.connect(self.window.showMinimized)
+        layout.addWidget(self.minimize_button)
+
+        self.maximize_button = QPushButton("□")
+        self.maximize_button.setObjectName("titleBarButton")
+        self.maximize_button.clicked.connect(self.toggle_maximize)
+        layout.addWidget(self.maximize_button)
+
+        self.close_button = QPushButton("×")
+        self.close_button.setObjectName("titleBarCloseButton")
+        self.close_button.clicked.connect(self.window.close)
+        layout.addWidget(self.close_button)
+
+        self.setFixedHeight(54)
+        self.sync_window_controls()
+        self.sync_window_state()
+
+    def toggle_maximize(self) -> None:
+        self.window.toggle_native_maximize_restore()
+        QTimer.singleShot(0, self.sync_window_state)
+
+    def sync_window_controls(self) -> None:
+        control_height = self.height()
+        control_width = max(60, int(control_height * 1.10))
+        close_width = max(60, int(control_height * 1.10))
+        self.minimize_button.setFixedSize(control_width, control_height)
+        self.maximize_button.setFixedSize(control_width, control_height)
+        self.close_button.setFixedSize(close_width, control_height)
+
+    def sync_window_state(self) -> None:
+        maximized = self.window.is_native_maximized()
+        self.maximize_button.setText("❐" if maximized else "□")
+        self.maximize_button.setToolTip("Windowed" if maximized else "Full screen")
+
+    def set_menu_expanded(self, expanded: bool) -> None:
+        self.toggle_button.setText("▼" if expanded else "▲")
+
+    def mouseDoubleClickEvent(self, event) -> None:  # type: ignore[override]
+        super().mouseDoubleClickEvent(event)
+
+    def mousePressEvent(self, event) -> None:  # type: ignore[override]
+        if event.button() == Qt.MouseButton.LeftButton:
+            child = self.childAt(event.position().toPoint())
+            if child is not None and child is not self:
+                event.ignore()
+                super().mousePressEvent(event)
+                return
+            self._drag_offset = event.globalPosition().toPoint() - self.window.frameGeometry().topLeft()
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event) -> None:  # type: ignore[override]
+        if self._drag_offset is not None and event.buttons() & Qt.MouseButton.LeftButton and not self.window.isMaximized():
+            self.window.move(event.globalPosition().toPoint() - self._drag_offset)
+            event.accept()
+            return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event) -> None:  # type: ignore[override]
+        self._drag_offset = None
+        super().mouseReleaseEvent(event)
+
+
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
+        self.setWindowFlags(Qt.WindowType.Window | Qt.WindowType.FramelessWindowHint)
         self.setWindowTitle(APP_TITLE)
-        self.resize(1120, 760)
-        self.setMinimumSize(980, 760)
+        self.resize(1380, 900)
+        self.setMinimumSize(1220, 840)
         self.apply_window_icon()
 
         self.dependencies_ready = False
@@ -1555,13 +1810,21 @@ class MainWindow(QMainWindow):
         self.update_config = load_update_config()
         self.user_settings = load_user_settings()
         self.cat_mode_enabled = bool(self.user_settings.get("cat_mode"))
+        self.classic_ui_enabled = bool(self.user_settings.get("classic_ui"))
         self.last_fetched_url = ""
         self.last_output_path: Path | None = None
         self.log_file_path = self.initialize_log_file()
         self._youtube_warning_logged = False
         self._last_display_log: str | None = None
         self._last_activity_phase: str | None = None
+        self.activity_entries: list[str] = []
+        self.layout_mode = "default"
         self.root_widget: QWidget | None = None
+        self.title_bar: WindowTitleBar | None = None
+        self.kittycat_menu: QFrame | None = None
+        self.activity_indicator_effect: QGraphicsOpacityEffect | None = None
+        self.activity_indicator_visible = True
+        self.resize_edges = Qt.Edge(0)
         self.cat_sprites: list[dict] = []
         self.kittycat_sound_path = self.prepare_kittycat_sound()
         self.cat_timer = QTimer(self)
@@ -1571,160 +1834,541 @@ class MainWindow(QMainWindow):
         self.url_fetch_timer.setInterval(1100)
         self.url_fetch_timer.setSingleShot(True)
         self.url_fetch_timer.timeout.connect(self.fetch_info_if_ready)
-
-        self.setFont(QFont("Segoe UI", 10))
-        self.setStyleSheet(self.build_stylesheet(self.cat_mode_enabled))
+        self.activity_timer = QTimer(self)
+        self.activity_timer.setInterval(380)
+        self.activity_timer.timeout.connect(self.tick_activity_indicator)
+        self.setFont(QFont("IBM Plex Sans", 11))
+        self.setStyleSheet(self.build_stylesheet(self.cat_mode_enabled, self.layout_mode, self.classic_ui_enabled))
         self.build_ui()
+        self.update_responsive_layout(force=True)
+        self.enable_native_cursor()
         self.apply_cat_mode(self.cat_mode_enabled)
         self.update_button_state()
         self.refresh_update_button()
         self.append_log(f"App version: {APP_VERSION}")
-        self.append_log("Ready. Paste a YouTube or Twitch link, choose full video or enter a clip range, then download.")
+        self.append_log("Ready. Paste a video link, choose full video or enter a clip range, then download.")
         self.start_dependency_check()
 
     def build_ui(self) -> None:
         root = QWidget()
         self.root_widget = root
+        root.setObjectName("appRoot")
         self.setCentralWidget(root)
         outer = QVBoxLayout(root)
-        outer.setContentsMargins(20, 20, 20, 20)
-        outer.setSpacing(16)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
 
-        header = QFrame()
-        header_layout = QVBoxLayout(header)
-        header_layout.setContentsMargins(0, 0, 0, 0)
-        header_layout.setSpacing(4)
+        self.title_bar = WindowTitleBar(self)
+        outer.addWidget(self.title_bar)
 
-        top_row = QHBoxLayout()
-        header_layout.addLayout(top_row)
+        self.header = QFrame()
+        self.header.setObjectName("appHeader")
+        self.header_layout = QVBoxLayout(self.header)
+        self.header_layout.setContentsMargins(48, 40, 48, 28)
+        self.header_layout.setSpacing(10)
 
-        brand_wrap = QVBoxLayout()
-        brand_wrap.setSpacing(4)
-        top_row.addLayout(brand_wrap)
+        self.header_top_layout = QBoxLayout(QBoxLayout.Direction.LeftToRight)
+        self.header_top_layout.setContentsMargins(0, 0, 0, 0)
+        self.header_top_layout.setSpacing(28)
+        self.header_layout.addLayout(self.header_top_layout)
 
-        eyebrow = QLabel("MerchTools")
-        eyebrow.setObjectName("eyebrow")
-        brand_wrap.addWidget(eyebrow)
+        self.brand_panel = QWidget()
+        self.brand_panel.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        brand_layout = QVBoxLayout(self.brand_panel)
+        brand_layout.setContentsMargins(0, 0, 0, 0)
+        brand_layout.setSpacing(12)
+        self.header_top_layout.addWidget(self.brand_panel, 1)
 
-        title = QLabel("Video Downloader")
-        title.setObjectName("heroTitle")
-        brand_wrap.addWidget(title)
-        top_row.addStretch(1)
-        pill_row = QHBoxLayout()
-        pill_row.setSpacing(12)
-        top_row.addLayout(pill_row)
+        eyebrow_row = QHBoxLayout()
+        eyebrow_row.setContentsMargins(0, 0, 0, 0)
+        eyebrow_row.setSpacing(12)
+        brand_layout.addLayout(eyebrow_row)
+
+        self.eyebrow_slashes = QLabel("//")
+        self.eyebrow_slashes.setObjectName("eyebrowAccent")
+        eyebrow_row.addWidget(self.eyebrow_slashes)
+
+        self.eyebrow_label = QLabel("MERCHTOOLS")
+        self.eyebrow_label.setObjectName("eyebrow")
+        eyebrow_row.addWidget(self.eyebrow_label)
+        eyebrow_row.addStretch(1)
+
+        self.hero_title = QLabel("Video Downloader")
+        self.hero_title.setObjectName("heroTitle")
+        self.hero_title.setWordWrap(True)
+        brand_layout.addWidget(self.hero_title)
+
+        self.header_action_panel = QWidget()
+        self.header_action_panel.setSizePolicy(QSizePolicy.Policy.Maximum, QSizePolicy.Policy.Fixed)
+        self.header_action_layout = QBoxLayout(QBoxLayout.Direction.LeftToRight, self.header_action_panel)
+        self.header_action_layout.setContentsMargins(0, 0, 0, 0)
+        self.header_action_layout.setSpacing(24)
+        self.header_top_layout.addWidget(self.header_action_panel, 0, Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignRight)
+
+        self.version_label = QLabel(f"v{APP_VERSION}")
+        self.version_label.setObjectName("versionPill")
+        self.header_action_layout.addWidget(self.version_label, 0, Qt.AlignmentFlag.AlignVCenter)
 
         self.check_updates_button = QPushButton("Check for updates")
         self.check_updates_button.setObjectName("versionPillButton")
         self.check_updates_button.clicked.connect(self.check_for_updates)
         self.check_updates_button.setCursor(Qt.CursorShape.PointingHandCursor)
-        pill_row.addWidget(self.check_updates_button)
+        self.header_action_layout.addWidget(self.check_updates_button, 0, Qt.AlignmentFlag.AlignVCenter)
 
-        self.version_label = QLabel(f"v{APP_VERSION}")
-        self.version_label.setObjectName("versionPill")
-        pill_row.addWidget(self.version_label)
+        self.main_content_layout = QBoxLayout(QBoxLayout.Direction.LeftToRight)
+        self.main_content_layout.setContentsMargins(0, 0, 0, 0)
+        self.main_content_layout.setSpacing(0)
+        outer.addWidget(self.header)
+        outer.addLayout(self.main_content_layout, 1)
 
-        content = QHBoxLayout()
-        content.setSpacing(16)
-        outer.addWidget(header)
-        outer.addLayout(content, 1)
+        self.left_panel = QWidget()
+        self.left_panel.setObjectName("leftPanel")
+        self.left_column = QVBoxLayout(self.left_panel)
+        self.left_column.setContentsMargins(20, 10, 16, 16)
+        self.left_column.setSpacing(14)
+        self.main_content_layout.addWidget(self.left_panel, 7)
 
-        left_column = QVBoxLayout()
-        left_column.setSpacing(16)
-        content.addLayout(left_column, 5)
+        self.activity_divider = QFrame()
+        self.activity_divider.setObjectName("activityDivider")
+        self.activity_divider.setFixedWidth(1)
+        self.main_content_layout.addWidget(self.activity_divider, 0)
 
-        video_card = CardFrame("Video Setup")
-        left_column.addWidget(video_card)
-
-        video_grid = QGridLayout()
-        video_grid.setHorizontalSpacing(12)
-        video_grid.setVerticalSpacing(12)
-        video_card.content_layout.addLayout(video_grid)
+        self.video_card = CardFrame("Video Setup")
+        self.left_column.addWidget(self.video_card)
 
         self.url_input = QLineEdit()
         self.url_input.setObjectName("primaryInput")
-        self.url_input.setPlaceholderText("Paste a YouTube or Twitch URL")
+        self.url_input.setAlignment(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft)
+        self.url_input.setMinimumHeight(54)
+        self.url_input.setMaximumHeight(54)
+        self.url_input.setPlaceholderText("Paste a video URL")
         self.url_input.textChanged.connect(self.on_url_changed)
+        self.video_url_label = self.make_field_label("Video URL")
+        self.video_url_row, self.video_url_row_layout = self.create_form_row(self.video_url_label, self.url_input)
+        self.video_card.content_layout.addWidget(self.video_url_row)
+
         saved_output_dir = self.user_settings.get("output_dir") or str(DEFAULT_OUTPUT_DIR)
         self.output_dir_input = QLineEdit(saved_output_dir)
         self.output_dir_input.setObjectName("primaryInput")
-        self.filename_input = QLineEdit()
-        self.filename_input.setPlaceholderText("Optional custom filename")
+        self.output_dir_input.setAlignment(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft)
+        self.output_dir_input.setMinimumHeight(54)
+        self.output_dir_input.setMaximumHeight(54)
         browse_button = QPushButton("Browse")
         browse_button.clicked.connect(self.choose_folder)
+        self.browse_button = browse_button
+        self.save_folder_label = self.make_field_label("Save Folder")
+        self.save_folder_input_wrap = QWidget()
+        self.save_folder_input_layout = QBoxLayout(QBoxLayout.Direction.LeftToRight, self.save_folder_input_wrap)
+        self.save_folder_input_layout.setContentsMargins(0, 0, 0, 0)
+        self.save_folder_input_layout.setSpacing(16)
+        self.save_folder_input_layout.addWidget(self.output_dir_input, 1)
+        self.save_folder_input_layout.addWidget(self.browse_button, 0)
+        self.save_folder_row, self.save_folder_row_layout = self.create_form_row(self.save_folder_label, self.save_folder_input_wrap)
+        self.video_card.content_layout.addWidget(self.save_folder_row)
 
-        video_grid.addWidget(self.make_field_label("Video URL"), 0, 0)
-        video_grid.addWidget(self.url_input, 0, 1, 1, 2)
-        video_grid.addWidget(self.make_field_label("Save Folder"), 1, 0)
-        video_grid.addWidget(self.output_dir_input, 1, 1)
-        video_grid.addWidget(browse_button, 1, 2)
-        video_grid.addWidget(self.make_field_label("Filename"), 2, 0)
-        video_grid.addWidget(self.filename_input, 2, 1, 1, 2)
+        self.filename_input = QLineEdit()
+        self.filename_input.setObjectName("primaryInput")
+        self.filename_input.setAlignment(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft)
+        self.filename_input.setMinimumHeight(54)
+        self.filename_input.setMaximumHeight(54)
+        self.filename_input.setPlaceholderText("Optional custom filename")
+        self.filename_label = self.make_field_label("Filename")
+        self.filename_row, self.filename_row_layout = self.create_form_row(self.filename_label, self.filename_input)
+        self.video_card.content_layout.addWidget(self.filename_row)
 
         self.video_meta = QLabel("Title: -\nDuration: -")
         self.video_meta.setObjectName("metaText")
         self.video_meta.setWordWrap(True)
-        video_card.content_layout.addWidget(self.video_meta)
+        self.video_meta.setMinimumHeight(52)
+        self.video_card.content_layout.addWidget(self.video_meta)
 
-        clip_card = CardFrame("Clip Range")
-        left_column.addWidget(clip_card)
-
-        clip_grid = QGridLayout()
-        clip_grid.setHorizontalSpacing(12)
-        clip_grid.setVerticalSpacing(12)
-        clip_card.content_layout.addLayout(clip_grid)
+        self.clip_card = CardFrame("Clip Range")
+        clip_card_layout = self.clip_card.layout()
+        if clip_card_layout is not None:
+            clip_card_layout.setContentsMargins(24, 14, 24, 29)
+        self.left_column.addWidget(self.clip_card)
 
         self.start_input = QLineEdit()
         self.start_input.setObjectName("timeInput")
+        self.start_input.setAlignment(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft)
+        self.start_input.setMinimumHeight(54)
+        self.start_input.setMaximumHeight(54)
         self.end_input = QLineEdit()
         self.end_input.setObjectName("timeInput")
+        self.end_input.setAlignment(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft)
+        self.end_input.setMinimumHeight(54)
+        self.end_input.setMaximumHeight(54)
         self.update_clip_range_placeholders()
 
-        clip_grid.addWidget(self.make_field_label("Start Time"), 0, 0)
-        clip_grid.addWidget(self.start_input, 0, 1)
-        clip_grid.addWidget(self.make_field_label("End Time"), 0, 2)
-        clip_grid.addWidget(self.end_input, 0, 3)
+        self.clip_fields_row = QWidget()
+        self.clip_fields_layout = QBoxLayout(QBoxLayout.Direction.LeftToRight, self.clip_fields_row)
+        self.clip_fields_layout.setContentsMargins(0, 0, 0, 0)
+        self.clip_fields_layout.setSpacing(18)
+        self.clip_card.content_layout.addWidget(self.clip_fields_row)
 
-        self.clip_hint = QLabel("Enter both start and end times for a clip, or enable full video mode.")
-        self.clip_hint.setObjectName("hintText")
-        self.clip_hint.setWordWrap(True)
-        clip_card.content_layout.addWidget(self.clip_hint)
+        self.start_field, self.start_field_layout, self.start_field_label = self.create_field_block("Start Time", self.start_input)
+        self.end_field, self.end_field_layout, self.end_field_label = self.create_field_block("End Time", self.end_input)
+        self.clip_fields_layout.addWidget(self.start_field, 1)
+        self.clip_fields_layout.addWidget(self.end_field, 1)
 
-        self.full_video_checkbox = QCheckBox("Download full video")
+        self.full_video_checkbox = IndustrialCheckBox("Download full video")
         self.full_video_checkbox.setObjectName("optionToggle")
         self.full_video_checkbox.toggled.connect(self.on_full_video_toggled)
-        clip_card.content_layout.addWidget(self.full_video_checkbox)
+        self.full_video_row = QWidget()
+        self.full_video_row_layout = QVBoxLayout(self.full_video_row)
+        self.full_video_row_layout.setContentsMargins(0, 5, 0, 0)
+        self.full_video_row_layout.setSpacing(0)
+        self.full_video_row_layout.addWidget(self.full_video_checkbox)
+        self.clip_card.content_layout.addWidget(self.full_video_row)
 
-        self.reveal_checkbox = QCheckBox("Reveal in Explorer after download completes")
+        self.reveal_checkbox = IndustrialCheckBox("Reveal in Explorer after download completes")
         self.reveal_checkbox.setObjectName("optionToggle")
         self.reveal_checkbox.setChecked(True)
-        clip_card.content_layout.addWidget(self.reveal_checkbox)
+        self.clip_card.content_layout.addWidget(self.reveal_checkbox)
 
-        self.cat_checkbox = QCheckBox("Kittycat")
+        self.left_column.addStretch(1)
+
+        self.right_panel = QFrame()
+        self.right_panel.setObjectName("activityPanel")
+        self.right_panel.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self.right_panel.setMinimumWidth(470)
+        right_layout = QVBoxLayout(self.right_panel)
+        right_layout.setContentsMargins(0, 0, 0, 0)
+        right_layout.setSpacing(0)
+        self.main_content_layout.addWidget(self.right_panel, 4)
+
+        activity_header = QFrame()
+        activity_header.setObjectName("activityHeader")
+        self.activity_header_layout = QHBoxLayout(activity_header)
+        self.activity_header_layout.setContentsMargins(28, 18, 28, 14)
+        self.activity_header_layout.setSpacing(12)
+
+        self.activity_indicator = QFrame()
+        self.activity_indicator.setObjectName("activityIndicator")
+        self.activity_indicator.setFixedSize(10, 10)
+        self.activity_indicator_effect = QGraphicsOpacityEffect(self.activity_indicator)
+        self.activity_indicator_effect.setOpacity(0.28)
+        self.activity_indicator.setGraphicsEffect(self.activity_indicator_effect)
+        self.activity_header_layout.addWidget(self.activity_indicator, 0, Qt.AlignmentFlag.AlignVCenter)
+
+        self.activity_title = QLabel("Activity")
+        self.activity_title.setObjectName("activityTitle")
+        self.activity_header_layout.addWidget(self.activity_title, 0, Qt.AlignmentFlag.AlignVCenter)
+        self.activity_header_layout.addStretch(1)
+
+        self.clear_log_button = QPushButton("Clear")
+        self.clear_log_button.setObjectName("activityClearButton")
+        self.clear_log_button.clicked.connect(self.clear_activity_log)
+        self.activity_header_layout.addWidget(self.clear_log_button, 0, Qt.AlignmentFlag.AlignVCenter)
+        right_layout.addWidget(activity_header)
+
+        self.activity_body = QFrame()
+        self.activity_body.setObjectName("activityBody")
+        self.activity_body_layout = QVBoxLayout(self.activity_body)
+        self.activity_body_layout.setContentsMargins(36, 28, 36, 24)
+        self.activity_body_layout.setSpacing(12)
+
+        self.log_output = QTextEdit()
+        self.log_output.setReadOnly(True)
+        self.log_output.setObjectName("logOutput")
+        self.activity_body_layout.addWidget(self.log_output, 1)
+        right_layout.addWidget(self.activity_body, 1)
+
+        self.download_section = QFrame()
+        self.download_section.setObjectName("downloadSection")
+        self.download_section_layout = QVBoxLayout(self.download_section)
+        self.download_section_layout.setContentsMargins(36, 28, 36, 28)
+        self.download_section_layout.setSpacing(0)
+
+        self.download_button = ProgressButton("DOWNLOAD")
+        self.download_button.setObjectName("accentButton")
+        self.download_button.clicked.connect(self.download_video)
+        self.download_button.setMinimumHeight(72)
+        self.download_button.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self.download_section_layout.addWidget(self.download_button)
+        right_layout.addWidget(self.download_section)
+
+        self.build_kittycat_menu()
+
+    def build_kittycat_menu(self) -> None:
+        self.kittycat_menu = QFrame(self)
+        self.kittycat_menu.setObjectName("kittycatMenu")
+        self.kittycat_menu.hide()
+        layout = QVBoxLayout(self.kittycat_menu)
+        layout.setContentsMargins(18, 16, 18, 16)
+        layout.setSpacing(12)
+
+        menu_label = QLabel("Secret Menu")
+        menu_label.setObjectName("kittycatMenuTitle")
+        layout.addWidget(menu_label)
+
+        self.cat_checkbox = IndustrialCheckBox("Kittycat")
         self.cat_checkbox.setObjectName("optionToggle")
         self.cat_checkbox.setChecked(self.cat_mode_enabled)
         self.cat_checkbox.toggled.connect(self.on_cat_mode_toggled)
-        clip_card.content_layout.addWidget(self.cat_checkbox)
+        layout.addWidget(self.cat_checkbox)
 
-        left_column.addStretch(1)
+        self.classic_ui_checkbox = IndustrialCheckBox("Classic UI (1.0.7)")
+        self.classic_ui_checkbox.setObjectName("optionToggle")
+        self.classic_ui_checkbox.setChecked(self.classic_ui_enabled)
+        self.classic_ui_checkbox.toggled.connect(self.on_classic_ui_toggled)
+        layout.addWidget(self.classic_ui_checkbox)
 
-        right_card = CardFrame("Activity")
-        right_card.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
-        right_card.setMinimumWidth(380)
-        content.addWidget(right_card, 4)
+        self.position_kittycat_menu()
 
-        self.log_output = QPlainTextEdit()
-        self.log_output.setReadOnly(True)
-        self.log_output.setObjectName("logOutput")
-        right_card.content_layout.addWidget(self.log_output)
+    def position_kittycat_menu(self) -> None:
+        if self.kittycat_menu is None or self.title_bar is None:
+            return
+        self.kittycat_menu.adjustSize()
+        toggle = getattr(self.title_bar, "toggle_button", None)
+        x = 14
+        if toggle is not None:
+            x = max(12, toggle.mapTo(self, QPoint(0, 0)).x() - 4)
+        y = self.title_bar.height() + 8
+        self.kittycat_menu.move(x, y)
 
-        self.download_button = ProgressButton("Download")
-        self.download_button.setObjectName("accentButton")
-        self.download_button.clicked.connect(self.download_video)
-        self.download_button.setMinimumHeight(56)
-        self.download_button.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
-        right_card.content_layout.addWidget(self.download_button)
-        right_card.content_layout.setStretch(0, 1)
+    def toggle_kittycat_menu(self) -> None:
+        if self.kittycat_menu is None or self.title_bar is None:
+            return
+        visible = not self.kittycat_menu.isVisible()
+        self.kittycat_menu.setVisible(visible)
+        self.kittycat_menu.raise_()
+        self.position_kittycat_menu()
+        self.title_bar.set_menu_expanded(visible)
+
+    def create_form_row(self, label: QLabel, content: QWidget) -> tuple[QWidget, QBoxLayout]:
+        row = QWidget()
+        layout = QBoxLayout(QBoxLayout.Direction.LeftToRight, row)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(22)
+        layout.addWidget(label, 0, Qt.AlignmentFlag.AlignVCenter)
+        layout.addWidget(content, 1)
+        return row, layout
+
+    def create_field_block(self, label_text: str, input_widget: QLineEdit) -> tuple[QWidget, QVBoxLayout, QLabel]:
+        block = QWidget()
+        layout = QVBoxLayout(block)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(8)
+        label = self.make_field_label(label_text)
+        layout.addWidget(label)
+        layout.addWidget(input_widget)
+        return block, layout, label
+
+    def set_field_label_width(self, label: QLabel, width: int | None) -> None:
+        if width is None:
+            label.setMinimumWidth(0)
+            label.setMaximumWidth(16777215)
+            return
+        label.setFixedWidth(width)
+
+    def update_responsive_layout(self, force: bool = False) -> None:
+        mode = "default"
+
+        stack_header = False
+        stack_panels = False
+        stack_form_rows = False
+        stack_folder_controls = False
+        stack_clip_fields = False
+
+        if force or mode != self.layout_mode:
+            self.layout_mode = mode
+            self.setStyleSheet(self.build_stylesheet(self.cat_mode_enabled, self.layout_mode, self.classic_ui_enabled))
+
+        if self.title_bar is not None:
+            title_bar_height = 56 if mode == "default" else 52
+            self.title_bar.setFixedHeight(title_bar_height)
+            self.title_bar.sync_window_controls()
+
+        if self.classic_ui_enabled:
+            self.header_layout.setContentsMargins(20, 8, 20, 8)
+        else:
+            self.header_layout.setContentsMargins(40, 24, 40, 18)
+        self.header_top_layout.setDirection(QBoxLayout.Direction.TopToBottom if stack_header else QBoxLayout.Direction.LeftToRight)
+        self.header_top_layout.setSpacing(10 if self.classic_ui_enabled else (18 if stack_header else 22))
+        self.header_top_layout.setAlignment(self.header_action_panel, Qt.AlignmentFlag.AlignLeft if stack_header else Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignRight)
+        self.header_action_layout.setDirection(QBoxLayout.Direction.LeftToRight)
+        self.header_action_layout.setSpacing(12 if self.classic_ui_enabled else 14)
+
+        self.main_content_layout.setDirection(QBoxLayout.Direction.LeftToRight)
+        self.main_content_layout.setStretch(0, 8)
+        self.main_content_layout.setStretch(1, 4)
+        self.right_panel.setMinimumWidth(380 if self.classic_ui_enabled else 420)
+        self.right_panel.setMaximumWidth(480 if self.classic_ui_enabled else 520)
+        if self.right_panel.property("stacked") != stack_panels:
+            self.right_panel.setProperty("stacked", stack_panels)
+            self.right_panel.style().unpolish(self.right_panel)
+            self.right_panel.style().polish(self.right_panel)
+
+        if self.classic_ui_enabled:
+            self.left_column.setContentsMargins(20, 20, 12, 20)
+            self.left_column.setSpacing(16)
+            self.activity_header_layout.setContentsMargins(22, 18, 22, 10)
+            self.activity_body_layout.setContentsMargins(22, 8, 22, 12)
+            self.download_section_layout.setContentsMargins(22, 12, 22, 22)
+        else:
+            self.left_column.setContentsMargins(20, 10, 16, 16)
+            self.left_column.setSpacing(14)
+            self.activity_header_layout.setContentsMargins(28, 18, 28, 14)
+            self.activity_body_layout.setContentsMargins(28, 22, 28, 20)
+            self.download_section_layout.setContentsMargins(28, 22, 28, 24)
+
+        self.video_url_row_layout.setDirection(QBoxLayout.Direction.LeftToRight)
+        self.video_url_row_layout.setSpacing(22)
+        self.save_folder_row_layout.setDirection(QBoxLayout.Direction.LeftToRight)
+        self.save_folder_row_layout.setSpacing(22)
+        self.filename_row_layout.setDirection(QBoxLayout.Direction.LeftToRight)
+        self.filename_row_layout.setSpacing(22)
+        self.save_folder_input_layout.setDirection(QBoxLayout.Direction.LeftToRight)
+        self.save_folder_input_layout.setSpacing(16)
+        self.clip_fields_layout.setDirection(QBoxLayout.Direction.LeftToRight)
+        self.clip_fields_layout.setSpacing(18)
+
+        label_width = 126
+        for label in (self.video_url_label, self.save_folder_label, self.filename_label):
+            self.set_field_label_width(label, label_width)
+        for row_layout, label in (
+            (self.video_url_row_layout, self.video_url_label),
+            (self.save_folder_row_layout, self.save_folder_label),
+            (self.filename_row_layout, self.filename_label),
+        ):
+            row_layout.setAlignment(label, Qt.AlignmentFlag.AlignVCenter)
+
+        self.browse_button.setMinimumHeight(54)
+        self.browse_button.setMaximumHeight(54)
+        self.browse_button.setMinimumWidth(124)
+        self.download_button.setMinimumHeight(72)
+
+    def enable_native_cursor(self) -> None:
+        self.unsetCursor()
+        self.register_cursor_tracking(self)
+
+    def native_hwnd(self) -> int | None:
+        if not IS_WINDOWS:
+            return None
+        try:
+            return int(self.winId())
+        except (TypeError, ValueError):
+            return None
+
+    def is_native_maximized(self) -> bool:
+        hwnd = self.native_hwnd()
+        if hwnd is None:
+            return self.isMaximized()
+        try:
+            return bool(ctypes.windll.user32.IsZoomed(hwnd))
+        except Exception:
+            return self.isMaximized()
+
+    def toggle_native_maximize_restore(self) -> None:
+        hwnd = self.native_hwnd()
+        if hwnd is None:
+            if self.isMaximized():
+                self.showNormal()
+            else:
+                self.showMaximized()
+            return
+        try:
+            command = SC_RESTORE if self.is_native_maximized() else SC_MAXIMIZE
+            ctypes.windll.user32.SendMessageW(hwnd, WM_SYSCOMMAND, command, 0)
+        except Exception:
+            if self.isMaximized():
+                self.showNormal()
+            else:
+                self.showMaximized()
+
+    def set_global_cursor(self, cursor_shape: Qt.CursorShape) -> None:
+        self.setCursor(cursor_shape)
+
+    def clear_global_cursor(self) -> None:
+        self.unsetCursor()
+
+    def register_cursor_tracking(self, widget: QWidget) -> None:
+        widget.setMouseTracking(True)
+        widget.installEventFilter(self)
+        for child in widget.findChildren(QWidget):
+            child.setMouseTracking(True)
+            child.installEventFilter(self)
+
+    def eventFilter(self, watched: QObject, event: QEvent) -> bool:  # type: ignore[override]
+        if isinstance(watched, QWidget):
+            if event.type() == QEvent.Type.MouseMove:
+                position = watched.mapTo(self, event.position().toPoint())  # type: ignore[attr-defined]
+                if self.update_resize_state(position):
+                    return False
+            elif event.type() == QEvent.Type.MouseButtonPress:
+                if self.kittycat_menu is not None and self.kittycat_menu.isVisible():
+                    if watched not in {self.kittycat_menu, self.title_bar, getattr(self.title_bar, "toggle_button", None), self.cat_checkbox} and not self.kittycat_menu.isAncestorOf(watched):
+                        self.kittycat_menu.hide()
+                        if self.title_bar is not None:
+                            self.title_bar.set_menu_expanded(False)
+                is_titlebar_widget = (
+                    self.title_bar is not None
+                    and isinstance(watched, QWidget)
+                    and (watched is self.title_bar or self.title_bar.isAncestorOf(watched))
+                )
+                if not is_titlebar_widget and self.try_start_resize(event.globalPosition().toPoint()):  # type: ignore[attr-defined]
+                    return True
+        return super().eventFilter(watched, event)
+
+    def update_resize_state(self, position: QPoint) -> bool:
+        if self.isMaximized():
+            self.resize_edges = Qt.Edge(0)
+            self.clear_global_cursor()
+            return False
+
+        margin = 6
+        rect = self.rect()
+        left = position.x() <= margin
+        right = position.x() >= rect.width() - margin
+        top = position.y() <= margin
+        bottom = position.y() >= rect.height() - margin
+
+        edges = Qt.Edge(0)
+        if left:
+            edges |= Qt.Edge.LeftEdge
+        if right:
+            edges |= Qt.Edge.RightEdge
+        if top:
+            edges |= Qt.Edge.TopEdge
+        if bottom:
+            edges |= Qt.Edge.BottomEdge
+        self.resize_edges = edges
+
+        if edges == Qt.Edge(0):
+            self.clear_global_cursor()
+            return False
+
+        if edges in {Qt.Edge.LeftEdge, Qt.Edge.RightEdge}:
+            cursor = Qt.CursorShape.SizeHorCursor
+        elif edges in {Qt.Edge.TopEdge, Qt.Edge.BottomEdge}:
+            cursor = Qt.CursorShape.SizeVerCursor
+        elif edges in {Qt.Edge.LeftEdge | Qt.Edge.TopEdge, Qt.Edge.RightEdge | Qt.Edge.BottomEdge}:
+            cursor = Qt.CursorShape.SizeFDiagCursor
+        else:
+            cursor = Qt.CursorShape.SizeBDiagCursor
+        self.set_global_cursor(cursor)
+        return True
+
+    def try_start_resize(self, global_pos: QPoint) -> bool:
+        if self.resize_edges == Qt.Edge(0) or self.isMaximized():
+            return False
+        handle = self.windowHandle()
+        if handle is None:
+            return False
+        return handle.startSystemResize(self.resize_edges)
+
+    def clear_activity_log(self) -> None:
+        self.activity_entries.clear()
+        self.refresh_activity_console()
+        self._last_display_log = None
+        self.append_log("Log cleared.")
+
+    def tick_activity_indicator(self) -> None:
+        if self.activity_indicator_effect is None:
+            return
+        self.activity_indicator_visible = not self.activity_indicator_visible
+        self.activity_indicator_effect.setOpacity(1.0 if self.activity_indicator_visible else 0.20)
 
     def apply_window_icon(self) -> None:
         for candidate in bundled_file_candidates("assets/app-icon.png"):
@@ -1736,158 +2380,428 @@ class MainWindow(QMainWindow):
                     app.setWindowIcon(icon)
                 return
 
-    def build_stylesheet(self, cat_mode: bool = False) -> str:
-        main_background = "#131516"
-        window_background = "#131516"
-        card_border = "#2a2e33"
-        card_background = "transparent"
-        input_background = "#171a1d"
-        primary_input_background = "#1b1f23"
-        primary_input_border = "#3a4148"
-        button_background = "#1b1f23"
-        button_hover = "#23282d"
-        if cat_mode:
-            main_background = "#1b1715"
-            window_background = "#201816"
-            card_border = "transparent"
+    def build_stylesheet(self, cat_mode: bool = False, layout_mode: str = "default", classic_ui: bool = False) -> str:
+        main_background = "#090909"
+        window_background = "#0d0d0d"
+        card_border = "#1e1e1e"
+        card_background = "#111111"
+        input_background = "#090909"
+        primary_input_background = "#090909"
+        primary_input_border = "#242424"
+        button_background = "#161616"
+        button_hover = "#1b1b1b"
+        text_color = "#ebebeb"
+        muted_text = "#8f8f8f"
+        dim_text = "#4a4a4a"
+        accent = "#c0ff33"
+        accent_soft = "rgba(192, 255, 51, 0.10)"
+        title_bar_icon_size = 22
+        title_bar_brand_size = 12
+        title_bar_title_size = 13
+        hero_title_size = 50
+        eyebrow_size = 11
+        eyebrow_accent_size = 13
+        version_size = 11
+        version_button_size = 11
+        card_title_size = 22
+        field_label_size = 11
+        body_text_size = 13
+        input_text_size = 14
+        time_input_size = 14
+        activity_title_size = 19
+        log_text_size = 14
+        activity_cursor_size = 18
+        checkbox_size = 13
+
+        if classic_ui:
+            main_background = "#131516"
+            window_background = "#131516"
+            card_border = "#2a2e33"
             card_background = "transparent"
-            input_background = "#211917"
-            primary_input_background = "#2a211d"
-            primary_input_border = "#7b6159"
-            button_background = "#2d221f"
-            button_hover = "#382925"
+            input_background = "#171a1d"
+            primary_input_background = "#1b1f23"
+            primary_input_border = "#3a4148"
+            button_background = "#1b1f23"
+            button_hover = "#23282d"
+            accent = "#ff9a55"
+            accent_soft = "rgba(255, 154, 85, 0.10)"
+            text_color = "#efe8dd"
+            muted_text = "#cbbda8"
+            dim_text = "#7d766d"
+            title_bar_brand_size = 11
+            title_bar_title_size = 12
+            hero_title_size = 32
+            version_size = 12
+            version_button_size = 12
+            card_title_size = 20
+            field_label_size = 12
+            body_text_size = 12
+            input_text_size = 14
+            time_input_size = 13
+            activity_title_size = 18
+            log_text_size = 13
+            checkbox_size = 14
+        elif layout_mode == "wide":
+            title_bar_icon_size = 24
+            title_bar_brand_size = 13
+            title_bar_title_size = 14
+            hero_title_size = 62
+            card_title_size = 24
+            body_text_size = 14
+            input_text_size = 15
+            time_input_size = 15
+            activity_title_size = 22
+            log_text_size = 15
+            activity_cursor_size = 20
+            checkbox_size = 14
+        elif layout_mode == "compact":
+            title_bar_icon_size = 22
+            title_bar_brand_size = 11
+            title_bar_title_size = 12
+            hero_title_size = 48
+            eyebrow_size = 10
+            eyebrow_accent_size = 12
+            version_size = 10
+            version_button_size = 10
+            card_title_size = 18
+            field_label_size = 10
+            body_text_size = 12
+            input_text_size = 13
+            time_input_size = 13
+            activity_title_size = 18
+            log_text_size = 13
+            activity_cursor_size = 16
+            checkbox_size = 12
 
         return f"""
+        QWidget#appRoot {{
+            background: {window_background};
+        }}
         QWidget {{
-            background: {main_background};
-            color: #efe8dd;
+            color: {text_color};
+        }}
+        QLabel, QCheckBox {{
+            background: transparent;
         }}
         QMainWindow {{
             background: {window_background};
         }}
+        QFrame#titleBar {{
+            background: {"#131516" if classic_ui else "#090909"};
+            border-bottom: {"none" if classic_ui else "1px solid #1e1e1e"};
+        }}
+        QPushButton#titleBarToggle {{
+            font-family: "DM Mono";
+            background: transparent;
+            color: {accent};
+            font-size: {title_bar_icon_size}px;
+            padding: 0px;
+            min-width: 22px;
+            min-height: 22px;
+            border: none;
+            letter-spacing: 0;
+        }}
+        QPushButton#titleBarToggle:hover {{
+            color: {text_color};
+            background: transparent;
+            border: none;
+        }}
+        QLabel#titleBarBrand {{
+            font-family: {"\"DM Mono\"" if not classic_ui else "\"Segoe UI\""};
+            color: {dim_text};
+            font-size: {title_bar_brand_size}px;
+            letter-spacing: {("0.24em" if not classic_ui else "0.08em")};
+        }}
+        QFrame#titleBarSeparator {{
+            background: #242424;
+            border: none;
+        }}
+        QLabel#titleBarTitle {{
+            font-family: {"\"IBM Plex Sans\"" if not classic_ui else "\"Segoe UI\""};
+            color: {text_color};
+            font-size: {title_bar_title_size}px;
+            font-weight: {500 if not classic_ui else 500};
+            letter-spacing: {("0.04em" if not classic_ui else "0.04em")};
+        }}
+        QPushButton#titleBarButton, QPushButton#titleBarCloseButton {{
+            font-family: "DM Mono";
+            background: transparent;
+            color: {muted_text};
+            border: none;
+            min-width: 52px;
+            min-height: 52px;
+            padding: 0px;
+            font-size: 18px;
+            letter-spacing: 0;
+            text-transform: none;
+            border-radius: 0px;
+        }}
+        QPushButton#titleBarCloseButton {{
+            font-size: 24px;
+        }}
+        QPushButton#titleBarButton:hover {{
+            background: {"transparent" if classic_ui else "#161616"};
+            color: {text_color};
+        }}
+        QPushButton#titleBarCloseButton:hover {{
+            background: {"transparent" if classic_ui else "#2a1010"};
+            color: {"#efe8dd" if classic_ui else "#ff4444"};
+        }}
+        QFrame#appHeader {{
+            background: {window_background};
+            border-bottom: {"none" if classic_ui else "1px solid #1e1e1e"};
+        }}
+        QFrame#kittycatMenu {{
+            background: {"#1b1f23" if classic_ui else "#111111"};
+            border: 1px solid {"#2a2e33" if classic_ui else "#1e1e1e"};
+            border-radius: {"12px" if classic_ui else "0px"};
+        }}
+        QFrame#activityDivider {{
+            background: {"#2a2e33" if classic_ui else "#1e1e1e"};
+            border: none;
+        }}
+        QLabel#kittycatMenuTitle {{
+            font-family: {"\"Segoe UI\"" if classic_ui else "\"DM Mono\""};
+            color: {muted_text};
+            font-size: 11px;
+            letter-spacing: {("0em" if classic_ui else "0.22em")};
+            text-transform: {("none" if classic_ui else "uppercase")};
+        }}
         QFrame#card {{
             background: {card_background};
             border: 1px solid {card_border};
-            border-radius: 20px;
+            border-radius: {20 if classic_ui else 0}px;
+        }}
+        QFrame#cardAccentLine {{
+            background: {"transparent" if classic_ui else "transparent"};
+            border: none;
+            max-height: 1px;
+        }}
+        QFrame#cardTitleDot {{
+            background: {"transparent" if classic_ui else accent};
+            border: none;
+            border-radius: 3px;
         }}
         QLabel#eyebrow {{
-            color: #cbbda8;
-            font-size: 12px;
+            color: {muted_text};
+            font-family: {"\"DM Mono\"" if not classic_ui else "\"Segoe UI\""};
+            font-size: {eyebrow_size}px;
             font-weight: 600;
-            letter-spacing: 0.08em;
+            letter-spacing: {("0.30em" if not classic_ui else "0.08em")};
             text-transform: uppercase;
         }}
+        QLabel#eyebrowAccent {{
+            color: {"transparent" if classic_ui else accent};
+            font-family: "DM Mono";
+            font-size: {eyebrow_accent_size}px;
+            font-weight: 500;
+            letter-spacing: 0.22em;
+        }}
         QLabel#heroTitle {{
-            font-family: "Trebuchet MS";
-            font-size: 32px;
-            font-weight: 700;
+            font-family: {"\"Syne\"" if not classic_ui else "\"Trebuchet MS\""};
+            font-size: {hero_title_size}px;
+            font-weight: {800 if not classic_ui else 700};
+            letter-spacing: {("-0.02em" if not classic_ui else "0em")};
         }}
         QLabel#versionPill {{
-            color: #cbbda8;
-            font-size: 12px;
-            font-weight: 700;
+            font-family: {"\"Segoe UI\"" if classic_ui else "\"DM Mono\""};
+            color: {dim_text};
+            font-size: {version_size}px;
+            font-weight: {700 if classic_ui else 500};
             padding: 0px;
+            letter-spacing: {("0em" if classic_ui else "0.18em")};
+            text-transform: {("none" if classic_ui else "uppercase")};
         }}
         QPushButton#versionPillButton {{
+            font-family: {"\"IBM Plex Sans\"" if not classic_ui else "\"Segoe UI\""};
             background: transparent;
-            color: #cbbda8;
-            font-size: 12px;
-            font-weight: 700;
-            padding: 0px;
-            border: none;
+            color: {muted_text};
+            font-size: {version_button_size}px;
+            font-weight: {500 if not classic_ui else 700};
+            letter-spacing: {("0.12em" if not classic_ui else "0em")};
+            text-transform: {("uppercase" if not classic_ui else "none")};
+            padding: {("10px 18px" if not classic_ui else "0px")};
+            border: {("1px solid #2e2e2e" if not classic_ui else "none")};
+            border-radius: {0 if not classic_ui else 0}px;
         }}
         QPushButton#versionPillButton:hover {{
-            color: #efe8dd;
+            color: {text_color if classic_ui else accent};
+            border-color: {accent};
+            background: {("transparent" if classic_ui else accent_soft)};
         }}
         QPushButton#versionPillButton:disabled {{
             background: transparent;
-            color: #7d766d;
-            border: none;
+            color: {dim_text};
+            border-color: {("#1e1e1e" if not classic_ui else "transparent")};
         }}
         QLabel#hintText, QLabel#metaText {{
-            color: #cbbda8;
-            line-height: 1.4;
+            font-family: {"\"Segoe UI\"" if classic_ui else "\"IBM Plex Sans\""};
+            color: {muted_text};
+            line-height: {("1.4" if classic_ui else "1.7")};
+            font-size: {body_text_size}px;
+            letter-spacing: {("0em" if classic_ui else "0.01em")};
         }}
         QCheckBox#optionToggle {{
-            color: #efe8dd;
-            spacing: 10px;
-            font-size: 13px;
+            font-family: {"\"Segoe UI\"" if classic_ui else "\"IBM Plex Sans\""};
+            color: {text_color};
+            spacing: 12px;
+            font-size: {checkbox_size}px;
+            letter-spacing: {("0em" if classic_ui else "0.02em")};
+            padding: 2px 0px;
+            background: transparent;
+            border: none;
+        }}
+        QCheckBox#optionToggle:hover {{
+            color: {text_color};
         }}
         QCheckBox#optionToggle::indicator {{
-            width: 18px;
-            height: 18px;
-            border-radius: 5px;
-            border: 1px solid #3a4148;
-            background: #171a1d;
+            width: {18 if classic_ui else 14}px;
+            height: {18 if classic_ui else 14}px;
+            border-radius: {5 if classic_ui else 0}px;
+            border: 1px solid {"#3a4148" if classic_ui else "#333333"};
+            background: {"#171a1d" if classic_ui else "#090909"};
         }}
         QCheckBox#optionToggle::indicator:checked {{
-            background: #ff9a55;
-            border: 1px solid #ff9a55;
+            background: {accent if classic_ui else accent_soft};
+            border: 1px solid {accent};
         }}
         QLabel#cardTitle {{
-            color: #efe8dd;
-            font-family: "Trebuchet MS";
-            font-size: 20px;
-            font-weight: 700;
+            color: {text_color};
+            font-family: {"\"Trebuchet MS\"" if classic_ui else "\"Syne\""};
+            font-size: {card_title_size}px;
+            font-weight: {700 if classic_ui else 800};
+            letter-spacing: {("0em" if classic_ui else "-0.01em")};
         }}
         QLabel#fieldLabel {{
-            color: #efe8dd;
-            font-size: 12px;
+            font-family: {"\"DM Mono\"" if not classic_ui else "\"Segoe UI\""};
+            color: {muted_text};
+            font-size: {field_label_size}px;
             font-weight: 600;
-            letter-spacing: 0.04em;
+            letter-spacing: {("0.24em" if not classic_ui else "0.04em")};
         }}
-        QLineEdit, QPlainTextEdit {{
+        QLineEdit, QTextEdit {{
+            font-family: {"\"IBM Plex Sans\"" if not classic_ui else "\"Segoe UI\""};
             background: {input_background};
-            border: 1px solid {card_border};
-            border-radius: 12px;
-            padding: 12px 14px;
-            color: #efe8dd;
-            selection-background-color: #ff9a55;
-            selection-color: #1a1613;
+            border: 1px solid #242424;
+            border-radius: {12 if classic_ui else 0}px;
+            color: {text_color};
+            selection-background-color: {accent};
+            selection-color: #090909;
+        }}
+        QLineEdit {{
+            padding: 0px 14px;
+        }}
+        QTextEdit {{
+            padding: 10px 14px;
         }}
         QLineEdit#primaryInput {{
-            font-size: 14px;
-            font-weight: 600;
-            min-height: 26px;
+            font-size: {input_text_size}px;
+            font-weight: {400 if not classic_ui else 600};
+            min-height: {46 if not classic_ui else 38}px;
             background: {primary_input_background};
             border: 1px solid {primary_input_border};
+            letter-spacing: {("0.02em" if not classic_ui else "0em")};
         }}
         QLineEdit#timeInput {{
-            min-height: 24px;
-            font-size: 13px;
+            min-height: {46 if not classic_ui else 36}px;
+            font-size: {time_input_size}px;
+            letter-spacing: {("0.02em" if not classic_ui else "0em")};
         }}
         QLineEdit:disabled {{
             background: #101214;
-            color: #72767c;
-            border: 1px solid #262a2f;
+            color: {dim_text};
+            border: 1px solid #1c1c1c;
         }}
-        QLineEdit:focus, QPlainTextEdit:focus {{
-            border: 1px solid #ff9a55;
+        QLineEdit:focus, QTextEdit:focus {{
+            border: 1px solid {accent};
         }}
         QPushButton {{
+            font-family: {"\"IBM Plex Sans\"" if not classic_ui else "\"Segoe UI\""};
             background: {button_background};
-            color: #efe8dd;
-            border: 1px solid {card_border};
-            border-radius: 12px;
+            color: {text_color if classic_ui else muted_text};
+            border: 1px solid #2e2e2e;
+            border-radius: {12 if classic_ui else 0}px;
             padding: 12px 16px;
             font-weight: 600;
+            letter-spacing: {("0.10em" if not classic_ui else "0em")};
+            text-transform: {("uppercase" if not classic_ui else "none")};
         }}
         QPushButton:hover {{
             background: {button_hover};
+            color: {text_color if classic_ui else accent};
+            border-color: {accent if not classic_ui else "#2e2e2e"};
         }}
         QPushButton:disabled {{
             background: #171a1d;
-            color: #7d766d;
+            color: {dim_text};
             border-color: #22262a;
         }}
         QPushButton#accentButton {{
-            font-size: 14px;
+            font-size: {12 if not classic_ui else 14}px;
             font-weight: 700;
-            padding: 13px 18px;
+            padding: {("18px 18px" if not classic_ui else "13px 18px")};
+            background: {accent_soft if not classic_ui else button_background};
+            color: {accent if not classic_ui else text_color};
+            border: 1px solid {accent if not classic_ui else card_border};
         }}
-        QPlainTextEdit#logOutput {{
-            font-family: Consolas, monospace;
-            font-size: 13px;
+        QFrame#activityPanel {{
+            background: {"transparent" if classic_ui else "#0d0d0d"};
+            border-left: none;
+            border: {"1px solid #2a2e33" if classic_ui else "none"};
+            border-radius: {"20px" if classic_ui else "0px"};
+        }}
+        QFrame#activityPanel[stacked="true"] {{
+            border-left: none;
+            border-top: 1px solid #1e1e1e;
+        }}
+        QFrame#activityHeader {{
+            background: {"transparent" if classic_ui else "#0d0d0d"};
+            border-bottom: {"none" if classic_ui else "1px solid #1e1e1e"};
+        }}
+        QFrame#activityBody {{
+            background: {"transparent" if classic_ui else "#090909"};
+            border-bottom: {"none" if classic_ui else "1px solid #1e1e1e"};
+        }}
+        QFrame#downloadSection {{
+            background: {"transparent" if classic_ui else "#0d0d0d"};
+        }}
+        QFrame#activityIndicator {{
+            background: {"transparent" if classic_ui else accent};
+            border-radius: 5px;
+        }}
+        QLabel#activityTitle {{
+            font-family: {"\"Trebuchet MS\"" if classic_ui else "\"Syne\""};
+            color: {text_color};
+            font-size: {activity_title_size}px;
+            font-weight: {700 if classic_ui else 700};
+        }}
+        QPushButton#activityClearButton {{
+            font-family: {"\"Segoe UI\"" if classic_ui else "\"IBM Plex Sans\""};
+            background: transparent;
+            border: none;
+            color: {dim_text};
+            font-size: 10px;
+            letter-spacing: {("0em" if classic_ui else "0.12em")};
+            text-transform: {("none" if classic_ui else "uppercase")};
+            padding: 0px;
+        }}
+        QPushButton#activityClearButton:hover {{
+            color: {muted_text};
+            background: transparent;
+            border: none;
+        }}
+        QTextEdit#logOutput {{
+            font-family: {"\"Consolas\"" if classic_ui else "\"DM Mono\""};
+            background: {"transparent" if classic_ui else "#090909"};
+            border: none;
+            color: {muted_text};
+            font-size: {log_text_size}px;
+            padding: 0px;
+        }}
+        QLabel#activityCursor {{
+            font-family: "DM Mono";
+            color: {accent};
+            font-size: {activity_cursor_size}px;
         }}
         """
 
@@ -1895,9 +2809,15 @@ class MainWindow(QMainWindow):
         self.apply_cat_mode(checked)
         self.persist_user_settings()
 
+    def on_classic_ui_toggled(self, checked: bool) -> None:
+        self.classic_ui_enabled = checked
+        self.setStyleSheet(self.build_stylesheet(self.cat_mode_enabled, self.layout_mode, self.classic_ui_enabled))
+        self.update_responsive_layout(force=True)
+        self.persist_user_settings()
+        self.position_kittycat_menu()
+
     def apply_cat_mode(self, enabled: bool) -> None:
         self.cat_mode_enabled = enabled
-        self.setStyleSheet(self.build_stylesheet(enabled))
         if enabled:
             self.create_cat_sprites()
             self.cat_timer.start()
@@ -2023,6 +2943,7 @@ class MainWindow(QMainWindow):
         label.setFixedSize(size, size)
         label.setStyleSheet("background: transparent;")
         label.clicked.connect(self.on_cat_clicked)
+        self.register_cursor_tracking(label)
         label.show()
         label.raise_()
 
@@ -2205,8 +3126,9 @@ class MainWindow(QMainWindow):
                 label.lower()
 
     def make_field_label(self, text: str) -> QLabel:
-        label = QLabel(text)
+        label = QLabel(text.upper())
         label.setObjectName("fieldLabel")
+        label.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
         return label
 
     def initialize_log_file(self) -> Path | None:
@@ -2231,7 +3153,14 @@ class MainWindow(QMainWindow):
 
     def resizeEvent(self, event) -> None:  # type: ignore[override]
         super().resizeEvent(event)
+        self.update_responsive_layout()
+        self.position_kittycat_menu()
         self.position_cat_sprites()
+
+    def changeEvent(self, event) -> None:  # type: ignore[override]
+        super().changeEvent(event)
+        if event.type() == QEvent.Type.WindowStateChange and self.title_bar is not None:
+            self.title_bar.sync_window_state()
 
     def format_activity_message(self, phase: str, text: str) -> str:
         if self._last_activity_phase == phase:
@@ -2377,15 +3306,43 @@ class MainWindow(QMainWindow):
         if display_message == self._last_display_log:
             return
         self._last_display_log = display_message
-        self.log_output.appendPlainText(display_message)
-        self.log_output.verticalScrollBar().setValue(self.log_output.verticalScrollBar().maximum())
+        self.activity_entries.append(self.render_activity_html(display_message))
+        self.refresh_activity_console()
 
     def set_status(self, text: str) -> None:
         if text != "Downloading...":
             self.download_button.set_progress_state(False, 0)
+            self.activity_timer.stop()
+            if self.activity_indicator_effect is not None:
+                self.activity_indicator_effect.setOpacity(0.20)
+        else:
+            self.activity_timer.start()
 
     def set_progress(self, value: int) -> None:
         self.download_button.set_progress_state(True, max(0, min(100, value)))
+
+    def render_activity_html(self, message: str) -> str:
+        text = html.escape(message).replace("\n", "<br>")
+        color = "#888888"
+        weight = "400"
+        if message.startswith("\n[") or (message.startswith("[") and message.endswith("]")):
+            color = "#888888"
+        if any(token in message.lower() for token in ["app is up to date", "download finished", "download complete", "loaded video", "duration:", "partial download removed"]):
+            color = "#c0ff33"
+            weight = "500"
+        return (
+            f"<div style=\"font-family:'DM Mono'; font-size:13px; letter-spacing:0.04em; "
+            f"line-height:1.9; color:{color}; font-weight:{weight};\">{text}</div>"
+        )
+
+    def refresh_activity_console(self) -> None:
+        body = "".join(self.activity_entries)
+        self.log_output.setHtml(
+            "<html><body style=\"margin:0; background:#090909;\">"
+            f"{body}"
+            "</body></html>"
+        )
+        self.log_output.verticalScrollBar().setValue(self.log_output.verticalScrollBar().maximum())
 
     def refresh_update_button(self) -> None:
         if not hasattr(self, "check_updates_button"):
@@ -2482,7 +3439,7 @@ class MainWindow(QMainWindow):
 
         url = self.apply_normalized_url()
         if not url:
-            self.show_error("Paste a YouTube or Twitch URL first.")
+            self.show_error("Paste a video URL first.")
             return
 
         output_dir = Path(self.output_dir_input.text().strip() or DEFAULT_OUTPUT_DIR)
@@ -2720,6 +3677,7 @@ class MainWindow(QMainWindow):
         save_user_settings({
             "output_dir": self.output_dir_input.text().strip() or str(DEFAULT_OUTPUT_DIR),
             "cat_mode": self.cat_mode_enabled,
+            "classic_ui": self.classic_ui_enabled,
         })
 
     def cleanup_cancelled_download(self) -> None:

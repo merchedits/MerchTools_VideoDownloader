@@ -1,6 +1,6 @@
 # MerchTools - Video Downloader
 
-Small desktop GUI for downloading the best quality YouTube or Twitch video with audio and saving only the clip range you want.
+Small desktop GUI for downloading the best quality video with audio and saving only the clip range you want.
 
 This version uses `PySide6` for a more modern desktop UI.
 
@@ -12,7 +12,7 @@ This version uses `PySide6` for a more modern desktop UI.
 - Lets you download the full video with a dedicated toggle
 - Shows a simple log so you can see what `yt-dlp` is doing
 - Checks on startup whether required tools are present and installs missing Python-based dependencies automatically
-- Accepts YouTube links, Twitch VODs, and Twitch clips
+- Accepts YouTube links, Twitch VODs, Twitch clips, and other sites supported by `yt-dlp`
 - Uses `TwitchDownloaderCLI` for Twitch VOD ranges and Twitch clips
 - Can check a hosted update manifest and download a newer installer from inside the app
 
@@ -24,8 +24,9 @@ This version uses `PySide6` for a more modern desktop UI.
 ## Notes
 
 - The whole app is built using ChatGPT 5.4 and Codex for personal use only.
-- YouTube downloads use `yt-dlp`.
+- YouTube and most non-Twitch sites use `yt-dlp`.
 - Twitch VOD ranges and Twitch clips use bundled `TwitchDownloaderCLI`.
+- Instagram Reels, TikTok, Twitter/X videos, and similar links can be attempted through the generic `yt-dlp` path when the site is supported.
 - Use the `Download full video` toggle if you want the entire source instead of a clipped range.
 - If `ffmpeg` is not installed system-wide, the app falls back to `imageio-ffmpeg` and uses its downloaded binary automatically.
 - When the app is packaged, it skips pip-based setup and prefers bundled dependencies.

@@ -1,6 +1,6 @@
 {
-  "version": "1.0.7",
-  "installer_url": "https://github.com/merchedits/MerchTools_VideoDownloader/releases/download/v1.0.7/MerchToolsVideoDownloaderSetup.exe",
+  "version": "1.0.8",
+  "installer_url": "https://github.com/merchedits/MerchTools_VideoDownloader/releases/download/v1.0.8/MerchToolsVideoDownloaderSetup.exe",
   "filename": "MerchToolsVideoDownloaderSetup.exe",
   "notes": "Added TwitchDownloaderCLI for fast Twitch VOD and clip handling, simplified hardware acceleration to automatic GPU-or-CPU fallback, and kept bundled SSL certificate handling for clean-machine reliability."
 }

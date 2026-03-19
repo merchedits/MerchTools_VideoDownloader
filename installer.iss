@@ -2,7 +2,7 @@
   #define MyAppName "MerchTools - Video Downloader"
 #endif
 #ifndef MyAppVersion
-  #define MyAppVersion "1.0.4"
+  #define MyAppVersion "1.0.8"
 #endif
 #ifndef MyAppPublisher
   #define MyAppPublisher "MerchEdits"
