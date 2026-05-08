@@ -15,7 +15,8 @@ This version uses `PySide6` for a more modern desktop UI.
 - Checks on startup whether required tools are present and refreshes Python-based downloader dependencies in development mode
 - Accepts YouTube links, Twitch VODs, Twitch clips, and other sites supported by `yt-dlp`
 - Uses `TwitchDownloaderCLI` for Twitch VOD ranges and Twitch clips
-- Supports optional automatic browser-cookie lookup for sites that require signed-in access
+- Uses a bundled PO-token provider for YouTube's current high-quality `mweb` path
+- Falls back to automatic browser-session lookup internally when YouTube requires signed-in access
 - Can check a hosted update manifest and download a newer installer from inside the app
 
 ## Requirements

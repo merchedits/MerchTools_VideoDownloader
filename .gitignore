@@ -11,3 +11,14 @@ downloads/
 ffmpeg.exe
 *.spec
 !MerchTools - Video Downloader.spec
+build-fresh/
+dist-fresh/
+node.exe
+tools/bgutil-ytdlp-pot-provider/server/node_modules/
+tools/bgutil-ytdlp-pot-provider/server/.cache/
+tools/tdcli-clip-full.mp4
+tools/tdcli-clip-trim.mp4
+tools/tdcli-current-test.mp4
+tools/twitchdl-test.mp4
+tools/twitchdl-test.ts
+tools/twitchdl.exe

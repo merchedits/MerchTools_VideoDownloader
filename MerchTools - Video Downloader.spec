@@ -19,6 +19,7 @@ app_name = "MerchTools - Video Downloader"
 ffmpeg_path = project_root / "ffmpeg.exe"
 node_path = project_root / "node.exe"
 twitch_downloader_path = project_root / "tools" / "TwitchDownloaderCLI" / "TwitchDownloaderCLI.exe"
+bgutil_provider_server_dir = project_root / "tools" / "bgutil-ytdlp-pot-provider" / "server"
 certifi_cacert = Path(certifi.where()) if certifi is not None else None
 font_dir = project_root / "assets" / "fonts"
 font_datas = [(str(path), "assets/fonts") for path in font_dir.glob("*.ttf")] if font_dir.exists() else []
@@ -37,7 +38,16 @@ a = Analysis(
         (str(project_root / "update_config.json"), "."),
         (str(project_root / "latest.example.json"), "."),
     ] + font_datas + ([(str(certifi_cacert), "pip/_vendor/certifi")] if certifi_cacert and certifi_cacert.exists() else []),
-    hiddenimports=['yt_dlp', 'imageio_ffmpeg', 'pip._vendor.certifi'],
+    hiddenimports=[
+        'yt_dlp',
+        'imageio_ffmpeg',
+        'pip._vendor.certifi',
+        'yt_dlp_plugins',
+        'yt_dlp_plugins.extractor',
+        'yt_dlp_plugins.extractor.getpot_bgutil',
+        'yt_dlp_plugins.extractor.getpot_bgutil_http',
+        'yt_dlp_plugins.extractor.getpot_bgutil_script',
+    ],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
@@ -45,6 +55,8 @@ a = Analysis(
     noarchive=False,
     optimize=0,
 )
+if bgutil_provider_server_dir.exists():
+    a.datas += Tree(str(bgutil_provider_server_dir), prefix="bgutil-ytdlp-pot-provider/server")
 pyz = PYZ(a.pure)
 
 exe = EXE(

@@ -3,6 +3,7 @@ import importlib
 import json
 import math
 import os
+import configparser
 import random
 import re
 import shutil
@@ -75,10 +76,12 @@ UPDATE_CONFIG_FILENAME = "update_config.json"
 SETTINGS_FILENAME = "user_settings.json"
 NODE_RUNTIME_FILENAME = "node.exe"
 TWITCH_DOWNLOADER_RELATIVE_PATH = Path("TwitchDownloaderCLI") / "TwitchDownloaderCLI.exe"
+BGUTIL_PROVIDER_SERVER_RELATIVE_PATH = Path("bgutil-ytdlp-pot-provider") / "server"
 DEFAULT_DOWNLOAD_FORMAT = "bestvideo*+bestaudio/best"
 REQUIRED_PYTHON_PACKAGES = [
     ("yt_dlp", "yt-dlp"),
     ("imageio_ffmpeg", "imageio-ffmpeg"),
+    ("yt_dlp_plugins.extractor.getpot_bgutil_script", "bgutil-ytdlp-pot-provider"),
 ]
 HARDWARE_ENCODER_CACHE: dict[str, str | None] = {}
 
@@ -97,6 +100,75 @@ WINDOWS_BROWSER_PROGIDS = {
     "operastable": "opera",
     "vivaldihtm": "vivaldi",
     "naverwhalehtml": "whale",
+}
+WINDOWS_BROWSER_COMMAND_HINTS = {
+    "chrome.exe": "chrome",
+    "msedge.exe": "edge",
+    "firefox.exe": "firefox",
+    "brave.exe": "brave",
+    "opera.exe": "opera",
+    "vivaldi.exe": "vivaldi",
+    "whale.exe": "whale",
+    "zen.exe": "zen",
+}
+COOKIE_BROWSER_DISPLAY_NAMES = {
+    "chrome": "Chrome",
+    "edge": "Edge",
+    "firefox": "Firefox",
+    "brave": "Brave",
+    "chromium": "Chromium",
+    "opera": "Opera",
+    "vivaldi": "Vivaldi",
+    "whale": "Whale",
+    "zen": "Zen Browser",
+}
+WINDOWS_BROWSER_EXECUTABLES = {
+    "chrome": [
+        r"%ProgramFiles%\Google\Chrome\Application\chrome.exe",
+        r"%LocalAppData%\Google\Chrome\Application\chrome.exe",
+    ],
+    "edge": [
+        r"%ProgramFiles(x86)%\Microsoft\Edge\Application\msedge.exe",
+        r"%ProgramFiles%\Microsoft\Edge\Application\msedge.exe",
+    ],
+    "firefox": [
+        r"%ProgramFiles%\Mozilla Firefox\firefox.exe",
+        r"%ProgramFiles(x86)%\Mozilla Firefox\firefox.exe",
+    ],
+    "brave": [
+        r"%ProgramFiles%\BraveSoftware\Brave-Browser\Application\brave.exe",
+        r"%LocalAppData%\BraveSoftware\Brave-Browser\Application\brave.exe",
+    ],
+    "chromium": [
+        r"%ProgramFiles%\Chromium\Application\chrome.exe",
+        r"%LocalAppData%\Chromium\Application\chrome.exe",
+    ],
+    "opera": [
+        r"%LocalAppData%\Programs\Opera\opera.exe",
+        r"%ProgramFiles%\Opera\opera.exe",
+    ],
+    "vivaldi": [
+        r"%LocalAppData%\Vivaldi\Application\vivaldi.exe",
+        r"%ProgramFiles%\Vivaldi\Application\vivaldi.exe",
+    ],
+    "whale": [
+        r"%LocalAppData%\Naver\Naver Whale\Application\whale.exe",
+        r"%ProgramFiles%\Naver\Naver Whale\Application\whale.exe",
+    ],
+    "zen": [
+        r"%ProgramFiles%\Zen Browser\zen.exe",
+        r"%LocalAppData%\Programs\Zen Browser\zen.exe",
+    ],
+}
+WINDOWS_FIREFOX_STYLE_PROFILE_ROOTS = {
+    "firefox": [
+        r"%APPDATA%\Mozilla\Firefox\Profiles",
+        r"%LOCALAPPDATA%\Packages\Mozilla.Firefox_n80bbvh6b1yt2\LocalCache\Roaming\Mozilla\Firefox\Profiles",
+    ],
+    "zen": [
+        r"%APPDATA%\zen\Profiles",
+        r"%APPDATA%\Zen\Profiles",
+    ],
 }
 PACKAGED_FONT_FILES = [
     "Syne-VariableFont_wght.ttf",
@@ -233,24 +305,57 @@ def resolve_js_runtime_executable() -> str | None:
     return shutil.which("node")
 
 
+def resolve_bgutil_provider_server_home() -> str | None:
+    for candidate in bundled_relative_candidates(BGUTIL_PROVIDER_SERVER_RELATIVE_PATH):
+        script_path = candidate / "build" / "generate_once.js"
+        if script_path.exists():
+            return str(candidate)
+    return None
+
+
+def configure_po_token_environment() -> None:
+    candidates = [
+        user_data_dir() / "cache",
+        application_dir() / ".cache",
+        Path(tempfile.gettempdir()) / "MerchTools" / "Video Downloader" / "cache",
+    ]
+    for cache_root in candidates:
+        try:
+            cache_root.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            continue
+        os.environ["XDG_CACHE_HOME"] = str(cache_root)
+        return
+
+
 def yt_dlp_js_runtime_options() -> dict:
     node_path = resolve_js_runtime_executable()
     if not node_path:
         return {}
+    provider_home = resolve_bgutil_provider_server_home()
+    extractor_args: dict[str, dict[str, list[str]]] = {
+        "youtube": {
+            "player_client": ["mweb", "android_vr"] if provider_home else ["web", "android_vr"],
+        }
+    }
+    if provider_home:
+        configure_po_token_environment()
+        extractor_args["youtubepot-bgutilscript"] = {"server_home": [provider_home]}
     return {
         "js_runtimes": {"node": {"path": node_path}},
         "remote_components": ["ejs:github"],
-        "extractor_args": {
-            "youtube": {
-                "player_client": ["web", "android_vr"],
-            }
-        },
+        "extractor_args": extractor_args,
     }
 
 
 def is_twitch_url(url: str) -> bool:
     host = urlparse(url).netloc.lower().replace("www.", "")
     return host in {"twitch.tv", "m.twitch.tv", "clips.twitch.tv"}
+
+
+def is_youtube_url(url: str) -> bool:
+    host = urlparse(url).netloc.lower().replace("www.", "")
+    return host in {"youtube.com", "m.youtube.com", "youtu.be"}
 
 
 def is_twitch_vod_url(url: str) -> bool:
@@ -296,24 +401,204 @@ def detect_default_browser_cookie_source() -> str | None:
         for prefix, browser in WINDOWS_BROWSER_PROGIDS.items():
             if prog_id.startswith(prefix):
                 return browser
+        command = resolve_windows_browser_command(prog_id)
+        if command:
+            hinted = detect_browser_from_command(command)
+            if hinted:
+                return hinted
     return None
 
 
-def browser_cookie_candidates() -> list[tuple[str, str | None, str | None, str | None]]:
+def expand_windows_path(path: str) -> Path:
+    return Path(os.path.expandvars(os.path.expanduser(path)))
+
+
+def resolve_windows_browser_command(prog_id: str) -> str | None:
+    if winreg is None or not prog_id:
+        return None
+
+    subkeys = [
+        (winreg.HKEY_CLASSES_ROOT, fr"{prog_id}\shell\open\command"),
+        (winreg.HKEY_CURRENT_USER, fr"Software\Classes\{prog_id}\shell\open\command"),
+    ]
+    for root, subkey in subkeys:
+        try:
+            with winreg.OpenKey(root, subkey) as key:
+                value = str(winreg.QueryValueEx(key, "")[0]).strip()
+        except OSError:
+            continue
+        if value:
+            return value
+    return None
+
+
+def detect_browser_from_command(command: str) -> str | None:
+    lowered = command.lower()
+    for executable, browser in WINDOWS_BROWSER_COMMAND_HINTS.items():
+        if executable in lowered:
+            return browser
+    return None
+
+
+def resolve_existing_path(paths: list[str]) -> Path | None:
+    for candidate in paths:
+        path = expand_windows_path(candidate)
+        if path.exists():
+            return path
+    return None
+
+
+def resolve_windows_app_path(executable_name: str) -> Path | None:
+    if winreg is None:
+        return None
+    subkeys = [
+        (winreg.HKEY_CURRENT_USER, fr"Software\Microsoft\Windows\CurrentVersion\App Paths\{executable_name}"),
+        (winreg.HKEY_LOCAL_MACHINE, fr"Software\Microsoft\Windows\CurrentVersion\App Paths\{executable_name}"),
+    ]
+    for root, subkey in subkeys:
+        try:
+            with winreg.OpenKey(root, subkey) as key:
+                value = str(winreg.QueryValueEx(key, "")[0]).strip().strip('"')
+        except OSError:
+            continue
+        path = Path(value)
+        if path.exists():
+            return path
+    return None
+
+
+def browser_executable_name(browser: str) -> str:
+    mapping = {
+        "chrome": "chrome.exe",
+        "edge": "msedge.exe",
+        "firefox": "firefox.exe",
+        "brave": "brave.exe",
+        "chromium": "chrome.exe",
+        "opera": "opera.exe",
+        "vivaldi": "vivaldi.exe",
+        "whale": "whale.exe",
+        "zen": "zen.exe",
+    }
+    return mapping[browser]
+
+
+def is_browser_installed(browser: str) -> bool:
+    if browser == "zen":
+        return resolve_firefox_style_profile("zen") is not None or resolve_existing_path(WINDOWS_BROWSER_EXECUTABLES["zen"]) is not None
+    if browser not in WINDOWS_BROWSER_EXECUTABLES:
+        return False
+    if resolve_existing_path(WINDOWS_BROWSER_EXECUTABLES[browser]) is not None:
+        return True
+    return resolve_windows_app_path(browser_executable_name(browser)) is not None
+
+
+def resolve_firefox_style_profile(browser: str) -> Path | None:
+    preferred = resolve_firefox_style_profile_from_ini(browser)
+    if preferred is not None:
+        return preferred
+    roots = WINDOWS_FIREFOX_STYLE_PROFILE_ROOTS.get(browser, [])
+    candidates: list[Path] = []
+    for root_text in roots:
+        root = expand_windows_path(root_text)
+        if not root.exists() or not root.is_dir():
+            continue
+        try:
+            for child in root.iterdir():
+                if child.is_dir() and (child / "cookies.sqlite").exists():
+                    candidates.append(child)
+        except OSError:
+            continue
+    if not candidates:
+        return None
+    def profile_mtime(path: Path) -> float:
+        try:
+            return path.stat().st_mtime
+        except OSError:
+            return 0.0
+    candidates.sort(key=profile_mtime, reverse=True)
+    return candidates[0]
+
+
+def resolve_firefox_style_root(browser: str) -> Path | None:
+    roots = WINDOWS_FIREFOX_STYLE_PROFILE_ROOTS.get(browser, [])
+    for root_text in roots:
+        root = expand_windows_path(root_text)
+        if root.exists():
+            return root.parent if root.name.lower() == "profiles" else root
+    if browser == "zen" and roots and is_browser_installed("zen"):
+        fallback_root = expand_windows_path(roots[0])
+        return fallback_root.parent if fallback_root.name.lower() == "profiles" else fallback_root
+    return None
+
+
+def resolve_firefox_style_profile_from_ini(browser: str) -> Path | None:
+    roots = WINDOWS_FIREFOX_STYLE_PROFILE_ROOTS.get(browser, [])
+    if not roots:
+        return None
+    ini_path = expand_windows_path(roots[0]).parent / "profiles.ini"
+    if not ini_path.exists():
+        return None
+    parser = configparser.ConfigParser()
+    try:
+        parser.read(ini_path, encoding="utf-8")
+    except (OSError, configparser.Error):
+        return None
+    fallback: Path | None = None
+    for section in parser.sections():
+        if not section.lower().startswith("profile"):
+            continue
+        profile_path = parser.get(section, "Path", fallback="").strip()
+        if not profile_path:
+            continue
+        is_relative = parser.getboolean(section, "IsRelative", fallback=True)
+        resolved = (ini_path.parent / profile_path) if is_relative else Path(profile_path)
+        cookies_db = resolved / "cookies.sqlite"
+        if cookies_db.exists():
+            if parser.getboolean(section, "Default", fallback=False):
+                return resolved
+            if fallback is None:
+                fallback = resolved
+    return fallback
+
+
+def cookie_browser_display_name(browser: str) -> str:
+    return COOKIE_BROWSER_DISPLAY_NAMES.get(browser, browser.title())
+
+
+def installed_cookie_browser_labels() -> list[str]:
+    labels: list[str] = []
+    for browser in ["zen", *COOKIE_BROWSER_PRIORITY]:
+        if is_browser_installed(browser):
+            labels.append(cookie_browser_display_name(browser))
+    return labels
+
+
+def browser_cookie_candidates() -> list[tuple[str, tuple[str, str | None, str | None, str | None]]]:
     ordered: list[str] = []
     default_browser = detect_default_browser_cookie_source()
     if default_browser:
         ordered.append(default_browser)
-    ordered.extend(COOKIE_BROWSER_PRIORITY)
+    ordered.extend(["zen", *COOKIE_BROWSER_PRIORITY])
 
     seen: set[str] = set()
-    candidates: list[tuple[str, str | None, str | None, str | None]] = []
+    candidates: list[tuple[str, tuple[str, str | None, str | None, str | None]]] = []
     for browser in ordered:
         normalized = browser.strip().lower()
         if not normalized or normalized in seen:
             continue
         seen.add(normalized)
-        candidates.append((normalized, None, None, None))
+        if normalized == "zen":
+            zen_profile = resolve_firefox_style_profile("zen")
+            if zen_profile is not None:
+                candidates.append((cookie_browser_display_name("zen"), ("firefox", str(zen_profile), None, None)))
+                continue
+            zen_root = resolve_firefox_style_root("zen")
+            if zen_root is not None:
+                candidates.append((cookie_browser_display_name("zen"), ("firefox", str(zen_root), None, None)))
+            continue
+        if not is_browser_installed(normalized):
+            continue
+        candidates.append((cookie_browser_display_name(normalized), (normalized, None, None, None)))
     return candidates
 
 
@@ -342,16 +627,29 @@ def is_browser_cookie_source_error(message: str) -> bool:
     return any(marker in lowered for marker in cookie_markers)
 
 
-def add_browser_cookie_hint(message: str, use_browser_cookies: bool) -> str:
+def add_browser_cookie_hint(message: str, automatic_auth_tried: bool) -> str:
     if not is_browser_cookie_auth_error(message):
         return message
-    if use_browser_cookies:
+    if automatic_auth_tried:
+        if not browser_cookie_candidates():
+            return (
+                f"{message}\n\n"
+                "The app could not find a supported browser session for automatic YouTube authentication. "
+                "Supported browsers include Zen, Firefox, Chrome, Edge, Brave, Chromium, Opera, Vivaldi, and Whale."
+            )
         return (
             f"{message}\n\n"
-            "The app already tried browser cookies. Make sure the video opens in your browser first, "
-            "then retry with the browser fully closed."
+            "The app already tried automatic browser authentication, but YouTube still rejected the request."
         )
-    return f'{message}\n\nEnable "Use browser cookies" and try again.'
+    if not browser_cookie_candidates():
+        return (
+            f"{message}\n\n"
+            "No supported browser session was found for automatic YouTube authentication."
+        )
+    return (
+        f"{message}\n\n"
+        "The app can retry automatically using an installed browser session."
+    )
 
 
 def load_application_fonts() -> None:
@@ -817,68 +1115,99 @@ class DependencyWorker(BaseWorker):
 
 
 class InfoWorker(BaseWorker):
-    def __init__(self, url: str, use_browser_cookies: bool = False) -> None:
+    def __init__(self, url: str) -> None:
         super().__init__()
         self.url = url
-        self.use_browser_cookies = use_browser_cookies
 
     def run(self) -> None:
         self.set_status("Fetching video info...")
         self.log(f"Fetching info for: {self.url}")
         is_twitch = is_twitch_url(self.url)
-        cookie_candidates = browser_cookie_candidates() if self.use_browser_cookies else [None]
+        is_youtube = is_youtube_url(self.url)
+        cookie_candidates = browser_cookie_candidates() if is_youtube else []
+        auth_tried = False
 
         for attempt in range(1, 4):
             last_error = "yt-dlp could not load the video."
-            for index, cookie_candidate in enumerate(cookie_candidates):
-                try:
-                    options = {
-                        "quiet": True,
-                        "no_warnings": True,
-                        "noplaylist": True,
-                        "forceipv4": True,
-                        "socket_timeout": 30,
-                        "retries": 10,
-                        "extractor_retries": 5,
-                        "fragment_retries": 10,
-                        "logger": YtDlpWorkerLogger(self),
-                    }
-                    if is_twitch:
-                        options["legacy_ssl_support"] = True
-                    options.update(yt_dlp_js_runtime_options())
-                    if cookie_candidate:
-                        options["cookiesfrombrowser"] = cookie_candidate
-                        self.log(f"Trying browser cookies: {cookie_candidate[0]}")
+            try:
+                options = {
+                    "quiet": True,
+                    "no_warnings": True,
+                    "noplaylist": True,
+                    "forceipv4": True,
+                    "socket_timeout": 30,
+                    "retries": 10,
+                    "extractor_retries": 5,
+                    "fragment_retries": 10,
+                    "logger": YtDlpWorkerLogger(self),
+                }
+                if is_twitch:
+                    options["legacy_ssl_support"] = True
+                options.update(yt_dlp_js_runtime_options())
 
-                    with YoutubeDL(options) as ydl:
-                        data = ydl.extract_info(self.url, download=False)
-                    self.signals.finished.emit(data)
-                    return
-                except DownloadError as error:
-                    message = str(error).strip() or "yt-dlp could not load the video."
-                    message = add_browser_cookie_hint(message, self.use_browser_cookies)
-                    last_error = message
-                    if cookie_candidate and index < len(cookie_candidates) - 1:
-                        self.log(f"Browser cookies from {cookie_candidate[0]} failed. Trying next browser...")
-                        continue
-                    if "WinError 10054" in message and "twitch" in self.url.lower() and attempt < 3:
-                        self.log(f"Twitch metadata request dropped. Retrying ({attempt}/2)...")
-                        time.sleep(1.5 * attempt)
-                        break
-                    self.emit_error(message)
-                    return
-                except Exception as error:  # noqa: BLE001
-                    message = str(error).strip() or "yt-dlp could not load the video."
-                    message = add_browser_cookie_hint(message, self.use_browser_cookies)
-                    last_error = message
-                    if cookie_candidate and index < len(cookie_candidates) - 1:
-                        self.log(f"Browser cookies from {cookie_candidate[0]} failed. Trying next browser...")
-                        continue
-                    self.emit_error(message)
-                    return
-            else:
-                self.emit_error(last_error)
+                with YoutubeDL(options) as ydl:
+                    data = ydl.extract_info(self.url, download=False)
+                self.signals.finished.emit(data)
                 return
+            except DownloadError as error:
+                message = str(error).strip() or "yt-dlp could not load the video."
+                last_error = message
+                if is_youtube and cookie_candidates and is_browser_cookie_auth_error(message):
+                    auth_tried = True
+                    cookie_error = self.try_info_with_browser_cookies(cookie_candidates, is_twitch)
+                    if cookie_error is None:
+                        return
+                    last_error = cookie_error
+                if "WinError 10054" in message and "twitch" in self.url.lower() and attempt < 3:
+                    self.log(f"Twitch metadata request dropped. Retrying ({attempt}/2)...")
+                    time.sleep(1.5 * attempt)
+                    continue
+                self.emit_error(add_browser_cookie_hint(last_error, auth_tried))
+                return
+            except Exception as error:  # noqa: BLE001
+                message = str(error).strip() or "yt-dlp could not load the video."
+                last_error = message
+                if is_youtube and cookie_candidates and is_browser_cookie_auth_error(message):
+                    auth_tried = True
+                    cookie_error = self.try_info_with_browser_cookies(cookie_candidates, is_twitch)
+                    if cookie_error is None:
+                        return
+                    last_error = cookie_error
+                self.emit_error(add_browser_cookie_hint(last_error, auth_tried))
+                return
+
+    def try_info_with_browser_cookies(
+        self,
+        cookie_candidates: list[tuple[str, tuple[str, str | None, str | None, str | None]]],
+        is_twitch: bool,
+    ) -> str | None:
+        last_error = "yt-dlp could not load the video."
+        for _, cookie_candidate in cookie_candidates:
+            try:
+                options = {
+                    "quiet": True,
+                    "no_warnings": True,
+                    "noplaylist": True,
+                    "forceipv4": True,
+                    "socket_timeout": 30,
+                    "retries": 10,
+                    "extractor_retries": 5,
+                    "fragment_retries": 10,
+                    "logger": YtDlpWorkerLogger(self),
+                    "cookiesfrombrowser": cookie_candidate,
+                }
+                if is_twitch:
+                    options["legacy_ssl_support"] = True
+                options.update(yt_dlp_js_runtime_options())
+                with YoutubeDL(options) as ydl:
+                    data = ydl.extract_info(self.url, download=False)
+                self.signals.finished.emit(data)
+                return None
+            except DownloadError as error:
+                last_error = str(error).strip() or "yt-dlp could not load the video."
+            except Exception as error:  # noqa: BLE001
+                last_error = str(error).strip() or "yt-dlp could not load the video."
+        return last_error
 
 
 class DownloadWorker(BaseWorker):
@@ -892,7 +1221,6 @@ class DownloadWorker(BaseWorker):
         start_seconds: int | None = None,
         end_seconds: int | None = None,
         use_hardware_acceleration: bool = False,
-        use_browser_cookies: bool = False,
         audio_only_wav: bool = False,
     ) -> None:
         super().__init__()
@@ -904,7 +1232,6 @@ class DownloadWorker(BaseWorker):
         self.start_seconds = start_seconds
         self.end_seconds = end_seconds
         self.use_hardware_acceleration = use_hardware_acceleration
-        self.use_browser_cookies = use_browser_cookies
         self.audio_only_wav = audio_only_wav
         self.cancel_requested = False
         self.ydl: YoutubeDL | None = None
@@ -917,6 +1244,7 @@ class DownloadWorker(BaseWorker):
         self.ffmpeg_progress_duration: float | int | None = expected_duration
         self.ffmpeg_progress_label = "Download progress"
         self.helper_process = None
+        self.used_browser_auth = False
 
     def cancel(self) -> None:
         if self.cancel_requested:
@@ -976,11 +1304,11 @@ class DownloadWorker(BaseWorker):
                     self.log("Download cancelled by user.")
                     self.signals.finished.emit({"cancelled": True})
                     return
-                last_error = add_browser_cookie_hint(str(error).strip() or "Download failed.", self.use_browser_cookies)
+                last_error = add_browser_cookie_hint(str(error).strip() or "Download failed.", self.used_browser_auth)
             except Exception as error:  # noqa: BLE001
                 self.ydl = None
                 self.ffmpeg_process = None
-                last_error = add_browser_cookie_hint(str(error).strip() or "Download failed.", self.use_browser_cookies)
+                last_error = add_browser_cookie_hint(str(error).strip() or "Download failed.", self.used_browser_auth)
 
             self.log(last_error)
             if "WinError 10054" in last_error and "twitch" in self.url.lower() and attempt < 3:
@@ -1008,13 +1336,15 @@ class DownloadWorker(BaseWorker):
         self.ffmpeg_progress_duration = self.expected_duration
         self.ffmpeg_progress_label = "Download progress"
         is_twitch = is_twitch_url(self.url)
-        cookie_candidates = browser_cookie_candidates() if self.use_browser_cookies else [None]
+        is_youtube = is_youtube_url(self.url)
+        cookie_candidates = browser_cookie_candidates() if is_youtube else []
 
         original_popen = yt_dlp_external.Popen
         yt_dlp_external.Popen = self.make_tracking_popen(original_popen)
         try:
-            last_error: Exception | None = None
-            for index, cookie_candidate in enumerate(cookie_candidates):
+            def build_options(
+                cookie_entry: tuple[str, tuple[str, str | None, str | None, str | None]] | None = None,
+            ) -> dict:
                 options = {
                     "quiet": True,
                     "noplaylist": True,
@@ -1037,18 +1367,39 @@ class DownloadWorker(BaseWorker):
                 if is_twitch:
                     options["legacy_ssl_support"] = True
                 options.update(yt_dlp_js_runtime_options())
-                if cookie_candidate:
+                if cookie_entry:
+                    _, cookie_candidate = cookie_entry
                     options["cookiesfrombrowser"] = cookie_candidate
-                    self.log(f"Trying browser cookies: {cookie_candidate[0]}")
                 options["external_downloader_args"] = {"ffmpeg_o": self.build_ffmpeg_output_args()}
                 ffmpeg_input_args = self.build_ffmpeg_input_args()
                 if ffmpeg_input_args:
                     options["external_downloader_args"]["ffmpeg_i"] = ffmpeg_input_args
                 if self.start_seconds is not None and self.end_seconds is not None:
                     options["download_ranges"] = download_range_func(None, [(self.start_seconds, self.end_seconds)])
+                return options
 
+            last_error: Exception | None = None
+            try:
+                with YoutubeDL(build_options()) as ydl:
+                    self.ydl = ydl
+                    code = ydl.download([self.url])
+                self.ydl = None
+                return code
+            except DownloadError as error:
+                self.ydl = None
+                last_error = error
+                if not (is_youtube and cookie_candidates and is_browser_cookie_auth_error(str(error))):
+                    raise
+            except Exception as error:  # noqa: BLE001
+                self.ydl = None
+                last_error = error
+                if not (is_youtube and cookie_candidates and is_browser_cookie_auth_error(str(error))):
+                    raise
+
+            self.used_browser_auth = True
+            for cookie_entry in cookie_candidates:
                 try:
-                    with YoutubeDL(options) as ydl:
+                    with YoutubeDL(build_options(cookie_entry)) as ydl:
                         self.ydl = ydl
                         code = ydl.download([self.url])
                     self.ydl = None
@@ -1056,17 +1407,11 @@ class DownloadWorker(BaseWorker):
                 except DownloadError as error:
                     self.ydl = None
                     last_error = error
-                    if cookie_candidate and index < len(cookie_candidates) - 1:
-                        self.log(f"Browser cookies from {cookie_candidate[0]} failed. Trying next browser...")
-                        continue
-                    raise
+                    continue
                 except Exception as error:  # noqa: BLE001
                     self.ydl = None
                     last_error = error
-                    if cookie_candidate and index < len(cookie_candidates) - 1:
-                        self.log(f"Browser cookies from {cookie_candidate[0]} failed. Trying next browser...")
-                        continue
-                    raise
+                    continue
             if last_error:
                 raise last_error
             return 1
@@ -2088,7 +2433,6 @@ class MainWindow(QMainWindow):
         self.user_settings = load_user_settings()
         self.cat_mode_enabled = bool(self.user_settings.get("cat_mode"))
         self.classic_ui_enabled = bool(self.user_settings.get("classic_ui"))
-        self.use_browser_cookies_enabled = bool(self.user_settings.get("use_browser_cookies"))
         self.audio_only_wav_enabled = bool(self.user_settings.get("audio_only_wav"))
         self.last_fetched_url = ""
         self.last_output_path: Path | None = None
@@ -2221,6 +2565,7 @@ class MainWindow(QMainWindow):
         self.url_input.setAlignment(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft)
         self.url_input.setMinimumHeight(54)
         self.url_input.setMaximumHeight(54)
+        self.url_input.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self.url_input.setPlaceholderText("Paste a video URL")
         self.url_input.textChanged.connect(self.on_url_changed)
         self.video_url_label = self.make_field_label("Video URL")
@@ -2233,7 +2578,9 @@ class MainWindow(QMainWindow):
         self.output_dir_input.setAlignment(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft)
         self.output_dir_input.setMinimumHeight(54)
         self.output_dir_input.setMaximumHeight(54)
+        self.output_dir_input.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         browse_button = QPushButton("Browse")
+        browse_button.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
         browse_button.clicked.connect(self.choose_folder)
         self.browse_button = browse_button
         self.save_folder_label = self.make_field_label("Save Folder")
@@ -2251,6 +2598,7 @@ class MainWindow(QMainWindow):
         self.filename_input.setAlignment(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft)
         self.filename_input.setMinimumHeight(54)
         self.filename_input.setMaximumHeight(54)
+        self.filename_input.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self.filename_input.setPlaceholderText("Optional custom filename")
         self.filename_label = self.make_field_label("Filename")
         self.filename_row, self.filename_row_layout = self.create_form_row(self.filename_label, self.filename_input)
@@ -2273,11 +2621,13 @@ class MainWindow(QMainWindow):
         self.start_input.setAlignment(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft)
         self.start_input.setMinimumHeight(54)
         self.start_input.setMaximumHeight(54)
+        self.start_input.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self.end_input = QLineEdit()
         self.end_input.setObjectName("timeInput")
         self.end_input.setAlignment(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft)
         self.end_input.setMinimumHeight(54)
         self.end_input.setMaximumHeight(54)
+        self.end_input.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self.update_clip_range_placeholders()
 
         self.clip_fields_row = QWidget()
@@ -2294,30 +2644,27 @@ class MainWindow(QMainWindow):
         self.full_video_checkbox = IndustrialCheckBox("Download full range")
         self.full_video_checkbox.setObjectName("optionToggle")
         self.full_video_checkbox.toggled.connect(self.on_full_video_toggled)
-        self.full_video_row = QWidget()
-        self.full_video_row_layout = QVBoxLayout(self.full_video_row)
-        self.full_video_row_layout.setContentsMargins(0, 5, 0, 0)
-        self.full_video_row_layout.setSpacing(0)
-        self.full_video_row_layout.addWidget(self.full_video_checkbox)
-        self.clip_card.content_layout.addWidget(self.full_video_row)
 
         self.wav_checkbox = IndustrialCheckBox("Download as WAV")
         self.wav_checkbox.setObjectName("optionToggle")
         self.wav_checkbox.setChecked(self.audio_only_wav_enabled)
         self.wav_checkbox.toggled.connect(lambda _: self.persist_user_settings())
-        self.clip_card.content_layout.addWidget(self.wav_checkbox)
-
-        self.cookies_checkbox = IndustrialCheckBox("Use browser cookies")
-        self.cookies_checkbox.setObjectName("optionToggle")
-        self.cookies_checkbox.setChecked(self.use_browser_cookies_enabled)
-        self.cookies_checkbox.setToolTip("Tries your default browser first, then other supported browsers if needed.")
-        self.cookies_checkbox.toggled.connect(lambda _: self.persist_user_settings())
-        self.clip_card.content_layout.addWidget(self.cookies_checkbox)
 
         self.reveal_checkbox = IndustrialCheckBox("Reveal in Explorer after download completes")
         self.reveal_checkbox.setObjectName("optionToggle")
         self.reveal_checkbox.setChecked(True)
-        self.clip_card.content_layout.addWidget(self.reveal_checkbox)
+
+        self.clip_options = QWidget()
+        self.clip_options_layout = QGridLayout(self.clip_options)
+        self.clip_options_layout.setContentsMargins(0, 6, 0, 0)
+        self.clip_options_layout.setHorizontalSpacing(28)
+        self.clip_options_layout.setVerticalSpacing(8)
+        self.clip_options_layout.addWidget(self.full_video_checkbox, 0, 0)
+        self.clip_options_layout.addWidget(self.wav_checkbox, 0, 1)
+        self.clip_options_layout.addWidget(self.reveal_checkbox, 1, 0, 1, 2)
+        self.clip_options_layout.setColumnStretch(0, 1)
+        self.clip_options_layout.setColumnStretch(1, 1)
+        self.clip_card.content_layout.addWidget(self.clip_options)
 
         self.left_column.addStretch(1)
 
@@ -2458,7 +2805,7 @@ class MainWindow(QMainWindow):
     def update_responsive_layout(self, force: bool = False) -> None:
         mode = "default"
         scale = min(self.width() / 1380, self.height() / 900, 1.0)
-        scale = max(0.82, scale)
+        scale = max(0.78, scale)
 
         stack_header = False
         stack_panels = False
@@ -2490,10 +2837,11 @@ class MainWindow(QMainWindow):
         self.header_action_layout.setSpacing(sp(12 if self.classic_ui_enabled else 14))
 
         self.main_content_layout.setDirection(QBoxLayout.Direction.LeftToRight)
-        self.main_content_layout.setStretch(0, 8)
-        self.main_content_layout.setStretch(1, 4)
-        self.right_panel.setMinimumWidth(sp(380 if self.classic_ui_enabled else 420))
-        self.right_panel.setMaximumWidth(sp(480 if self.classic_ui_enabled else 520))
+        self.main_content_layout.setStretch(0, 9)
+        self.main_content_layout.setStretch(1, 0)
+        self.main_content_layout.setStretch(2, 4)
+        self.right_panel.setMinimumWidth(sp(340 if self.classic_ui_enabled else 360))
+        self.right_panel.setMaximumWidth(sp(430 if self.classic_ui_enabled else 470))
         if self.right_panel.property("stacked") != stack_panels:
             self.right_panel.setProperty("stacked", stack_panels)
             self.right_panel.style().unpolish(self.right_panel)
@@ -2522,8 +2870,10 @@ class MainWindow(QMainWindow):
         self.save_folder_input_layout.setSpacing(sp(16))
         self.clip_fields_layout.setDirection(QBoxLayout.Direction.LeftToRight)
         self.clip_fields_layout.setSpacing(sp(18))
+        self.clip_options_layout.setHorizontalSpacing(sp(22))
+        self.clip_options_layout.setVerticalSpacing(sp(6))
 
-        label_width = sp(126)
+        label_width = max(sp(138), 116)
         for label in (self.video_url_label, self.save_folder_label, self.filename_label):
             self.set_field_label_width(label, label_width)
         for row_layout, label in (
@@ -2533,7 +2883,7 @@ class MainWindow(QMainWindow):
         ):
             row_layout.setAlignment(label, Qt.AlignmentFlag.AlignVCenter)
 
-        field_height = sp(54)
+        field_height = max(sp(54), 46)
         self.video_meta.setMinimumHeight(sp(52))
         self.activity_indicator.setFixedSize(sp(10), sp(10))
         for widget in (self.url_input, self.output_dir_input, self.filename_input, self.start_input, self.end_input, self.browse_button):
@@ -2692,6 +3042,8 @@ class MainWindow(QMainWindow):
     ) -> str:
         def sp(value: int) -> int:
             return max(1, int(round(value * scale)))
+        def smax(value: int, minimum: int) -> int:
+            return max(minimum, sp(value))
         body_font_family = "\"IBM Plex Sans Var\", \"IBM Plex Sans\""
         mono_font_family = "\"IBM Plex Mono\", \"DM Mono\""
 
@@ -2709,23 +3061,24 @@ class MainWindow(QMainWindow):
         dim_text = "#4a4a4a"
         accent = "#c0ff33"
         accent_soft = "rgba(192, 255, 51, 0.10)"
-        title_bar_icon_size = sp(22)
-        title_bar_brand_size = sp(12)
-        title_bar_title_size = sp(13)
-        hero_title_size = sp(50)
-        eyebrow_size = sp(11)
-        eyebrow_accent_size = sp(13)
-        version_size = sp(11)
-        version_button_size = sp(11)
-        card_title_size = sp(22)
-        field_label_size = sp(11)
-        body_text_size = sp(13)
-        input_text_size = sp(14)
-        time_input_size = sp(14)
-        activity_title_size = sp(19)
-        log_text_size = sp(14)
-        activity_cursor_size = sp(18)
-        checkbox_size = sp(13)
+        title_bar_icon_size = smax(22, 18)
+        title_bar_brand_size = smax(12, 11)
+        title_bar_title_size = smax(13, 12)
+        hero_title_size = smax(44, 34)
+        eyebrow_size = smax(12, 11)
+        eyebrow_accent_size = smax(14, 12)
+        version_size = smax(12, 11)
+        version_button_size = smax(12, 11)
+        card_title_size = smax(22, 19)
+        field_label_size = smax(13, 12)
+        body_text_size = smax(13, 12)
+        input_text_size = smax(14, 12)
+        time_input_size = smax(14, 12)
+        activity_title_size = smax(19, 17)
+        log_text_size = smax(14, 11)
+        activity_cursor_size = smax(18, 14)
+        checkbox_size = smax(13, 12)
+        button_text_size = smax(12, 11)
 
         if classic_ui:
             main_background = "#131516"
@@ -2744,17 +3097,18 @@ class MainWindow(QMainWindow):
             dim_text = "#7d766d"
             title_bar_brand_size = sp(11)
             title_bar_title_size = sp(12)
-            hero_title_size = sp(32)
-            version_size = sp(12)
-            version_button_size = sp(12)
-            card_title_size = sp(20)
-            field_label_size = sp(12)
-            body_text_size = sp(12)
-            input_text_size = sp(14)
-            time_input_size = sp(13)
-            activity_title_size = sp(18)
-            log_text_size = sp(13)
-            checkbox_size = sp(14)
+            hero_title_size = smax(32, 26)
+            version_size = smax(12, 11)
+            version_button_size = smax(12, 11)
+            card_title_size = smax(20, 18)
+            field_label_size = smax(13, 12)
+            body_text_size = smax(12, 11)
+            input_text_size = smax(14, 12)
+            time_input_size = smax(13, 12)
+            activity_title_size = smax(18, 16)
+            log_text_size = smax(13, 11)
+            checkbox_size = smax(14, 12)
+            button_text_size = smax(12, 11)
 
         return f"""
         QWidget#appRoot {{
@@ -2972,7 +3326,7 @@ class MainWindow(QMainWindow):
             selection-color: #090909;
         }}
         QLineEdit {{
-            padding: 0px 14px;
+            padding: 0px 14px 1px 14px;
         }}
         QTextEdit {{
             padding: 10px 14px;
@@ -3004,7 +3358,8 @@ class MainWindow(QMainWindow):
             color: {text_color if classic_ui else muted_text};
             border: 1px solid #2e2e2e;
             border-radius: {12 if classic_ui else 0}px;
-            padding: 12px 16px;
+            padding: {sp(8)}px {sp(16)}px;
+            font-size: {button_text_size}px;
             font-weight: 600;
             letter-spacing: {("0.10em" if not classic_ui else "0em")};
             text-transform: {("uppercase" if not classic_ui else "none")};
@@ -3526,6 +3881,16 @@ class MainWindow(QMainWindow):
             return None
         if text.startswith("[youtube] [jsc:node] Downloading challenge solver core script from "):
             return None
+        if text.startswith("[youtube] [pot:bgutil:http] "):
+            return None
+        if text.startswith("[youtube] [pot:bgutil:script-node] "):
+            return None
+        if text.startswith("[youtube] [pot:bgutil:script-deno] "):
+            return None
+        if text.startswith("[youtube] [pot] "):
+            return None
+        if text.startswith("[youtube] Skipping client ") and "does not support cookies" in text:
+            return None
         if text.startswith("[youtube] [jsc] Error solving n challenge request using "):
             return None
         if text.startswith("input = NChallengeInput("):
@@ -3558,6 +3923,16 @@ class MainWindow(QMainWindow):
         if text.startswith("[download] 100% of "):
             return None
         if text == "\x1b[0;31mERROR:\x1b[0m ffmpeg exited with code 1":
+            return None
+        if text.startswith("Trying browser cookies: "):
+            return None
+        if text.startswith("Browser cookies from "):
+            return None
+        if text.startswith("[Cookies] "):
+            return None
+        if text.lower().startswith("extracting cookies from "):
+            return None
+        if text.lower().startswith("extracted ") and " cookies from " in text.lower():
             return None
         if text.startswith("Download progress: "):
             progress_match = re.search(r"Download progress: (\d+)% \(([^,]+) / ([^,)]+)", text)
@@ -3608,14 +3983,16 @@ class MainWindow(QMainWindow):
         text = html.escape(message).replace("\n", "<br>")
         color = "#888888"
         weight = "400"
+        font_size = max(11, int(round(13 * self.ui_scale)))
+        line_height = max(1.55, 1.9 * self.ui_scale)
         if message.startswith("\n[") or (message.startswith("[") and message.endswith("]")):
             color = "#888888"
         if any(token in message.lower() for token in ["app is up to date", "download finished", "download complete", "loaded video", "duration:", "partial download removed"]):
             color = "#c0ff33"
             weight = "500"
         return (
-            f"<div style=\"font-family:'IBM Plex Mono','DM Mono'; font-size:13px; letter-spacing:0.04em; "
-            f"line-height:1.9; color:{color}; font-weight:{weight};\">{text}</div>"
+            f"<div style=\"font-family:'IBM Plex Mono','DM Mono'; font-size:{font_size}px; letter-spacing:0.04em; "
+            f"line-height:{line_height:.2f}; color:{color}; font-weight:{weight};\">{text}</div>"
         )
 
     def refresh_activity_console(self) -> None:
@@ -3704,7 +4081,7 @@ class MainWindow(QMainWindow):
         self.set_status("Fetching video info...")
         self.update_button_state()
         self.append_log("Starting metadata lookup...")
-        worker = InfoWorker(url, use_browser_cookies=self.cookies_checkbox.isChecked())
+        worker = InfoWorker(url)
         self.run_worker(
             worker,
             self.on_info_loaded,
@@ -3736,7 +4113,6 @@ class MainWindow(QMainWindow):
             )
             return
         audio_only_wav = self.wav_checkbox.isChecked()
-        use_browser_cookies = self.cookies_checkbox.isChecked()
         self.persist_user_settings()
         target_output_path = self.resolve_output_path(output_dir, audio_only_wav=audio_only_wav)
         if target_output_path.exists():
@@ -3808,7 +4184,6 @@ class MainWindow(QMainWindow):
             start_seconds=start_seconds,
             end_seconds=end_seconds,
             use_hardware_acceleration=True,
-            use_browser_cookies=use_browser_cookies,
             audio_only_wav=audio_only_wav,
         )
         self.run_worker(
@@ -3965,7 +4340,6 @@ class MainWindow(QMainWindow):
             "output_dir": self.output_dir_input.text().strip() or str(DEFAULT_OUTPUT_DIR),
             "cat_mode": self.cat_mode_enabled,
             "classic_ui": self.classic_ui_enabled,
-            "use_browser_cookies": self.cookies_checkbox.isChecked() if hasattr(self, "cookies_checkbox") else self.use_browser_cookies_enabled,
             "audio_only_wav": self.wav_checkbox.isChecked() if hasattr(self, "wav_checkbox") else self.audio_only_wav_enabled,
         })
 
@@ -4252,6 +4626,7 @@ class MainWindow(QMainWindow):
 
 def main() -> None:
     configure_ssl_environment()
+    configure_po_token_environment()
     app = QApplication(sys.argv)
     load_application_fonts()
     window = MainWindow()

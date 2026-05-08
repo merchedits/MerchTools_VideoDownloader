@@ -1,6 +1,6 @@
 {
-  "version": "1.0.9",
-  "installer_url": "https://github.com/merchedits/MerchTools_VideoDownloader/releases/download/v1.0.9/MerchToolsVideoDownloaderSetup.exe",
+  "version": "1.0.11",
+  "installer_url": "https://github.com/merchedits/MerchTools_VideoDownloader/releases/download/v1.0.11/MerchToolsVideoDownloaderSetup.exe",
   "filename": "MerchToolsVideoDownloaderSetup.exe",
-  "notes": "Added WAV export, automatic browser-cookie support, bundled UI fonts, and smoother small-window scaling while keeping fast Twitch downloads and automatic hardware acceleration."
+  "notes": "Replaced the cookie toggle with an automatic YouTube PO-token path, kept browser auth fallback internal, bundled the bgutil provider, and preserved fast Twitch downloads plus WAV export."
 }
