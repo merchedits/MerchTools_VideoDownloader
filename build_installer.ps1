@@ -21,6 +21,7 @@ $AppSourceDir = if (Test-Path $FreshVersionedSourceDir) {
 } else {
     "dist\$AppName"
 }
+$AppSourceDir = $AppSourceDir -replace "\\", "/"
 $LatestJsonPath = Join-Path $ProjectRoot "latest.json"
 $PossiblePaths = @(
     (Get-Command iscc -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Source -ErrorAction SilentlyContinue),
