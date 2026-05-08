@@ -20,6 +20,8 @@ ffmpeg_path = project_root / "ffmpeg.exe"
 node_path = project_root / "node.exe"
 twitch_downloader_path = project_root / "tools" / "TwitchDownloaderCLI" / "TwitchDownloaderCLI.exe"
 certifi_cacert = Path(certifi.where()) if certifi is not None else None
+font_dir = project_root / "assets" / "fonts"
+font_datas = [(str(path), "assets/fonts") for path in font_dir.glob("*.ttf")] if font_dir.exists() else []
 
 a = Analysis(
     [str(project_root / "app.py")],
@@ -34,7 +36,7 @@ a = Analysis(
         (str(project_root / "assets" / "app-icon.png"), "assets"),
         (str(project_root / "update_config.json"), "."),
         (str(project_root / "latest.example.json"), "."),
-    ] + ([(str(certifi_cacert), "pip/_vendor/certifi")] if certifi_cacert and certifi_cacert.exists() else []),
+    ] + font_datas + ([(str(certifi_cacert), "pip/_vendor/certifi")] if certifi_cacert and certifi_cacert.exists() else []),
     hiddenimports=['yt_dlp', 'imageio_ffmpeg', 'pip._vendor.certifi'],
     hookspath=[],
     hooksconfig={},

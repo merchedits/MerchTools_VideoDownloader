@@ -37,7 +37,7 @@ from yt_dlp import YoutubeDL
 from yt_dlp.utils import DownloadError, download_range_func
 from yt_dlp.downloader import external as yt_dlp_external
 from PySide6.QtCore import QObject, QPoint, QEvent, QThread, Qt, Signal, QTimer
-from PySide6.QtGui import QColor, QFont, QIcon, QPainter, QPen, QPixmap, QPolygon
+from PySide6.QtGui import QColor, QFont, QFontDatabase, QIcon, QPainter, QPen, QPixmap, QPolygon
 from PySide6.QtWidgets import (
     QApplication,
     QBoxLayout,
@@ -65,6 +65,11 @@ try:
 except ImportError:
     winsound = None
 
+try:
+    import winreg
+except ImportError:
+    winreg = None
+
 DEFAULT_OUTPUT_DIR = Path.home() / "Documents" / "MerchTools" / "Video Downloader"
 UPDATE_CONFIG_FILENAME = "update_config.json"
 SETTINGS_FILENAME = "user_settings.json"
@@ -81,6 +86,24 @@ IS_WINDOWS = sys.platform.startswith("win")
 WM_SYSCOMMAND = 0x0112
 SC_RESTORE = 0xF120
 SC_MAXIMIZE = 0xF030
+COOKIE_BROWSER_PRIORITY = ["chrome", "edge", "firefox", "brave", "chromium", "opera", "vivaldi", "whale"]
+WINDOWS_BROWSER_PROGIDS = {
+    "chromehtml": "chrome",
+    "msehtm": "edge",
+    "msedgehtm": "edge",
+    "firefoxurl": "firefox",
+    "bravehtml": "brave",
+    "chromiumhtm": "chromium",
+    "operastable": "opera",
+    "vivaldihtm": "vivaldi",
+    "naverwhalehtml": "whale",
+}
+PACKAGED_FONT_FILES = [
+    "Syne-VariableFont_wght.ttf",
+    "IBMPlexSansVar-Roman.ttf",
+    "IBMPlexMono-Regular.ttf",
+    "IBMPlexMono-Medium.ttf",
+]
 
 
 def format_seconds(total_seconds: float | int | None) -> str:
@@ -187,6 +210,15 @@ def bundled_relative_candidates(relative_path: Path) -> list[Path]:
     ]
 
 
+def bundled_directory_candidates(relative_path: Path) -> list[Path]:
+    base_dir = application_dir()
+    return [
+        base_dir / relative_path,
+        base_dir / "_internal" / relative_path,
+        Path(__file__).resolve().parent / relative_path,
+    ]
+
+
 def bundled_executable_path(filename: str) -> str | None:
     for candidate in bundled_file_candidates(filename):
         if candidate.exists():
@@ -245,6 +277,91 @@ def user_data_dir() -> Path:
     if appdata:
         return Path(appdata) / "MerchTools" / "Video Downloader"
     return Path.home() / "AppData" / "Roaming" / "MerchTools" / "Video Downloader"
+
+
+def detect_default_browser_cookie_source() -> str | None:
+    if not IS_WINDOWS or winreg is None:
+        return None
+
+    candidate_keys = [
+        (winreg.HKEY_CURRENT_USER, r"Software\Microsoft\Windows\Shell\Associations\UrlAssociations\https\UserChoice"),
+        (winreg.HKEY_CURRENT_USER, r"Software\Microsoft\Windows\Shell\Associations\UrlAssociations\http\UserChoice"),
+    ]
+    for root, subkey in candidate_keys:
+        try:
+            with winreg.OpenKey(root, subkey) as key:
+                prog_id = str(winreg.QueryValueEx(key, "ProgId")[0]).strip().lower()
+        except OSError:
+            continue
+        for prefix, browser in WINDOWS_BROWSER_PROGIDS.items():
+            if prog_id.startswith(prefix):
+                return browser
+    return None
+
+
+def browser_cookie_candidates() -> list[tuple[str, str | None, str | None, str | None]]:
+    ordered: list[str] = []
+    default_browser = detect_default_browser_cookie_source()
+    if default_browser:
+        ordered.append(default_browser)
+    ordered.extend(COOKIE_BROWSER_PRIORITY)
+
+    seen: set[str] = set()
+    candidates: list[tuple[str, str | None, str | None, str | None]] = []
+    for browser in ordered:
+        normalized = browser.strip().lower()
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        candidates.append((normalized, None, None, None))
+    return candidates
+
+
+def is_browser_cookie_auth_error(message: str) -> bool:
+    lowered = message.lower()
+    return (
+        "cookies-from-browser" in lowered
+        or "sign in to confirm you're not a bot" in lowered
+        or "sign in to confirm you’re not a bot" in lowered
+        or "authentication" in lowered and "youtube" in lowered
+    )
+
+
+def is_browser_cookie_source_error(message: str) -> bool:
+    lowered = message.lower()
+    cookie_markers = (
+        "cookies from browser",
+        "cookie database",
+        "could not find",
+        "could not locate",
+        "failed to decrypt",
+        "no such file or directory",
+        "permission denied",
+        "browser",
+    )
+    return any(marker in lowered for marker in cookie_markers)
+
+
+def add_browser_cookie_hint(message: str, use_browser_cookies: bool) -> str:
+    if not is_browser_cookie_auth_error(message):
+        return message
+    if use_browser_cookies:
+        return (
+            f"{message}\n\n"
+            "The app already tried browser cookies. Make sure the video opens in your browser first, "
+            "then retry with the browser fully closed."
+        )
+    return f'{message}\n\nEnable "Use browser cookies" and try again.'
+
+
+def load_application_fonts() -> None:
+    for font_dir in bundled_directory_candidates(Path("assets") / "fonts"):
+        if not font_dir.exists() or not font_dir.is_dir():
+            continue
+        for filename in PACKAGED_FONT_FILES:
+            font_path = font_dir / filename
+            if font_path.exists():
+                QFontDatabase.addApplicationFont(str(font_path))
 
 
 def settings_path() -> Path:
@@ -602,10 +719,7 @@ class DependencyWorker(BaseWorker):
             else:
                 self.ensure_pip_available()
                 for module_name, package_name in REQUIRED_PYTHON_PACKAGES:
-                    if self.module_available(module_name):
-                        self.log(f"{package_name} is already installed.")
-                        continue
-                    self.install_package(package_name)
+                    self.ensure_latest_package(module_name, package_name)
 
             ffmpeg_path = self.resolve_ffmpeg_executable()
             if not ffmpeg_path:
@@ -645,10 +759,13 @@ class DependencyWorker(BaseWorker):
             if result.returncode != 0:
                 raise RuntimeError(result.stderr.strip() or "ensurepip failed.")
 
-    def install_package(self, package_name: str) -> None:
-        self.log(f"Installing missing package: {package_name}")
+    def ensure_latest_package(self, module_name: str, package_name: str) -> None:
+        if self.module_available(module_name):
+            self.log(f"Checking for {package_name} updates...")
+        else:
+            self.log(f"Installing missing package: {package_name}")
         process = subprocess.Popen(
-            [sys.executable, "-m", "pip", "install", package_name],
+            [sys.executable, "-m", "pip", "install", "--upgrade", package_name],
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
@@ -665,7 +782,7 @@ class DependencyWorker(BaseWorker):
 
         exit_code = process.wait()
         if exit_code != 0:
-            raise RuntimeError(f"Installing {package_name} failed with exit code {exit_code}.")
+            raise RuntimeError(f"Updating {package_name} failed with exit code {exit_code}.")
 
     def module_available(self, module_name: str) -> bool:
         try:
@@ -700,45 +817,67 @@ class DependencyWorker(BaseWorker):
 
 
 class InfoWorker(BaseWorker):
-    def __init__(self, url: str) -> None:
+    def __init__(self, url: str, use_browser_cookies: bool = False) -> None:
         super().__init__()
         self.url = url
+        self.use_browser_cookies = use_browser_cookies
 
     def run(self) -> None:
         self.set_status("Fetching video info...")
         self.log(f"Fetching info for: {self.url}")
         is_twitch = is_twitch_url(self.url)
+        cookie_candidates = browser_cookie_candidates() if self.use_browser_cookies else [None]
 
         for attempt in range(1, 4):
-            try:
-                options = {
-                    "quiet": True,
-                    "no_warnings": True,
-                    "noplaylist": True,
-                    "forceipv4": True,
-                    "socket_timeout": 30,
-                    "retries": 10,
-                    "extractor_retries": 5,
-                    "fragment_retries": 10,
-                    "logger": YtDlpWorkerLogger(self),
-                }
-                if is_twitch:
-                    options["legacy_ssl_support"] = True
-                options.update(yt_dlp_js_runtime_options())
-                with YoutubeDL(options) as ydl:
-                    data = ydl.extract_info(self.url, download=False)
-                self.signals.finished.emit(data)
-                return
-            except DownloadError as error:
-                message = str(error).strip() or "yt-dlp could not load the video."
-                if "WinError 10054" in message and "twitch" in self.url.lower() and attempt < 3:
-                    self.log(f"Twitch metadata request dropped. Retrying ({attempt}/2)...")
-                    time.sleep(1.5 * attempt)
-                    continue
-                self.emit_error(message)
-                return
-            except Exception as error:  # noqa: BLE001
-                self.emit_error(str(error))
+            last_error = "yt-dlp could not load the video."
+            for index, cookie_candidate in enumerate(cookie_candidates):
+                try:
+                    options = {
+                        "quiet": True,
+                        "no_warnings": True,
+                        "noplaylist": True,
+                        "forceipv4": True,
+                        "socket_timeout": 30,
+                        "retries": 10,
+                        "extractor_retries": 5,
+                        "fragment_retries": 10,
+                        "logger": YtDlpWorkerLogger(self),
+                    }
+                    if is_twitch:
+                        options["legacy_ssl_support"] = True
+                    options.update(yt_dlp_js_runtime_options())
+                    if cookie_candidate:
+                        options["cookiesfrombrowser"] = cookie_candidate
+                        self.log(f"Trying browser cookies: {cookie_candidate[0]}")
+
+                    with YoutubeDL(options) as ydl:
+                        data = ydl.extract_info(self.url, download=False)
+                    self.signals.finished.emit(data)
+                    return
+                except DownloadError as error:
+                    message = str(error).strip() or "yt-dlp could not load the video."
+                    message = add_browser_cookie_hint(message, self.use_browser_cookies)
+                    last_error = message
+                    if cookie_candidate and index < len(cookie_candidates) - 1:
+                        self.log(f"Browser cookies from {cookie_candidate[0]} failed. Trying next browser...")
+                        continue
+                    if "WinError 10054" in message and "twitch" in self.url.lower() and attempt < 3:
+                        self.log(f"Twitch metadata request dropped. Retrying ({attempt}/2)...")
+                        time.sleep(1.5 * attempt)
+                        break
+                    self.emit_error(message)
+                    return
+                except Exception as error:  # noqa: BLE001
+                    message = str(error).strip() or "yt-dlp could not load the video."
+                    message = add_browser_cookie_hint(message, self.use_browser_cookies)
+                    last_error = message
+                    if cookie_candidate and index < len(cookie_candidates) - 1:
+                        self.log(f"Browser cookies from {cookie_candidate[0]} failed. Trying next browser...")
+                        continue
+                    self.emit_error(message)
+                    return
+            else:
+                self.emit_error(last_error)
                 return
 
 
@@ -753,6 +892,8 @@ class DownloadWorker(BaseWorker):
         start_seconds: int | None = None,
         end_seconds: int | None = None,
         use_hardware_acceleration: bool = False,
+        use_browser_cookies: bool = False,
+        audio_only_wav: bool = False,
     ) -> None:
         super().__init__()
         self.url = url
@@ -763,6 +904,8 @@ class DownloadWorker(BaseWorker):
         self.start_seconds = start_seconds
         self.end_seconds = end_seconds
         self.use_hardware_acceleration = use_hardware_acceleration
+        self.use_browser_cookies = use_browser_cookies
+        self.audio_only_wav = audio_only_wav
         self.cancel_requested = False
         self.ydl: YoutubeDL | None = None
         self.ffmpeg_process = None
@@ -833,11 +976,11 @@ class DownloadWorker(BaseWorker):
                     self.log("Download cancelled by user.")
                     self.signals.finished.emit({"cancelled": True})
                     return
-                last_error = str(error).strip() or "Download failed."
+                last_error = add_browser_cookie_hint(str(error).strip() or "Download failed.", self.use_browser_cookies)
             except Exception as error:  # noqa: BLE001
                 self.ydl = None
                 self.ffmpeg_process = None
-                last_error = str(error).strip() or "Download failed."
+                last_error = add_browser_cookie_hint(str(error).strip() or "Download failed.", self.use_browser_cookies)
 
             self.log(last_error)
             if "WinError 10054" in last_error and "twitch" in self.url.lower() and attempt < 3:
@@ -865,62 +1008,112 @@ class DownloadWorker(BaseWorker):
         self.ffmpeg_progress_duration = self.expected_duration
         self.ffmpeg_progress_label = "Download progress"
         is_twitch = is_twitch_url(self.url)
-
-        options = {
-            "quiet": True,
-            "noplaylist": True,
-            "forceipv4": True,
-            "socket_timeout": 30,
-            "retries": 10,
-            "extractor_retries": 5,
-            "fragment_retries": 10,
-            "format": DEFAULT_DOWNLOAD_FORMAT,
-            "merge_output_format": "mp4",
-            "ffmpeg_location": self.ffmpeg_path,
-            "outtmpl": self.output_template,
-            "force_keyframes_at_cuts": self.start_seconds is not None and self.end_seconds is not None,
-            "progress_hooks": [self.on_progress],
-            "logger": YtDlpWorkerLogger(self),
-        }
-        if is_twitch:
-            options["legacy_ssl_support"] = True
-        options.update(yt_dlp_js_runtime_options())
-        options["external_downloader_args"] = {"ffmpeg_o": self.build_ffmpeg_output_args()}
-        ffmpeg_input_args = self.build_ffmpeg_input_args()
-        if ffmpeg_input_args:
-            options["external_downloader_args"]["ffmpeg_i"] = ffmpeg_input_args
-        if self.start_seconds is not None and self.end_seconds is not None:
-            options["download_ranges"] = download_range_func(None, [(self.start_seconds, self.end_seconds)])
+        cookie_candidates = browser_cookie_candidates() if self.use_browser_cookies else [None]
 
         original_popen = yt_dlp_external.Popen
         yt_dlp_external.Popen = self.make_tracking_popen(original_popen)
         try:
-            with YoutubeDL(options) as ydl:
-                self.ydl = ydl
-                code = ydl.download([self.url])
-            self.ydl = None
+            last_error: Exception | None = None
+            for index, cookie_candidate in enumerate(cookie_candidates):
+                options = {
+                    "quiet": True,
+                    "noplaylist": True,
+                    "forceipv4": True,
+                    "socket_timeout": 30,
+                    "retries": 10,
+                    "extractor_retries": 5,
+                    "fragment_retries": 10,
+                    "format": "bestaudio/best" if self.audio_only_wav else DEFAULT_DOWNLOAD_FORMAT,
+                    "ffmpeg_location": self.ffmpeg_path,
+                    "outtmpl": self.output_template,
+                    "force_keyframes_at_cuts": self.start_seconds is not None and self.end_seconds is not None,
+                    "progress_hooks": [self.on_progress],
+                    "logger": YtDlpWorkerLogger(self),
+                }
+                if not self.audio_only_wav:
+                    options["merge_output_format"] = "mp4"
+                else:
+                    options["postprocessors"] = [{"key": "FFmpegExtractAudio", "preferredcodec": "wav"}]
+                if is_twitch:
+                    options["legacy_ssl_support"] = True
+                options.update(yt_dlp_js_runtime_options())
+                if cookie_candidate:
+                    options["cookiesfrombrowser"] = cookie_candidate
+                    self.log(f"Trying browser cookies: {cookie_candidate[0]}")
+                options["external_downloader_args"] = {"ffmpeg_o": self.build_ffmpeg_output_args()}
+                ffmpeg_input_args = self.build_ffmpeg_input_args()
+                if ffmpeg_input_args:
+                    options["external_downloader_args"]["ffmpeg_i"] = ffmpeg_input_args
+                if self.start_seconds is not None and self.end_seconds is not None:
+                    options["download_ranges"] = download_range_func(None, [(self.start_seconds, self.end_seconds)])
+
+                try:
+                    with YoutubeDL(options) as ydl:
+                        self.ydl = ydl
+                        code = ydl.download([self.url])
+                    self.ydl = None
+                    return code
+                except DownloadError as error:
+                    self.ydl = None
+                    last_error = error
+                    if cookie_candidate and index < len(cookie_candidates) - 1:
+                        self.log(f"Browser cookies from {cookie_candidate[0]} failed. Trying next browser...")
+                        continue
+                    raise
+                except Exception as error:  # noqa: BLE001
+                    self.ydl = None
+                    last_error = error
+                    if cookie_candidate and index < len(cookie_candidates) - 1:
+                        self.log(f"Browser cookies from {cookie_candidate[0]} failed. Trying next browser...")
+                        continue
+                    raise
+            if last_error:
+                raise last_error
+            return 1
         finally:
             yt_dlp_external.Popen = original_popen
             self.ffmpeg_process = None
             self.helper_process = None
             self.ffmpeg_progress_state = {}
-        return code
 
     def run_twitch_vod_download(self, helper_path: str) -> int:
+        output_path = Path(self.output_path)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+
+        if not self.audio_only_wav:
+            return self.run_twitch_vod_helper_download(helper_path, output_path)
+
+        temp_dir = user_data_dir() / "temp" / "twitch-vod"
+        temp_dir.mkdir(parents=True, exist_ok=True)
+        temp_media = temp_dir / f"{output_path.stem}.source.mp4"
+        if temp_media.exists():
+            temp_media.unlink()
+        try:
+            code = self.run_twitch_vod_helper_download(helper_path, temp_media)
+            if code != 0:
+                return code
+            if self.cancel_requested:
+                raise KeyboardInterrupt
+            return self.extract_wav_from_media(temp_media, output_path)
+        finally:
+            if temp_media.exists():
+                try:
+                    temp_media.unlink()
+                except OSError:
+                    pass
+
+    def run_twitch_vod_helper_download(self, helper_path: str, destination: Path) -> int:
         self.ffmpeg_progress_base = 0
-        self.ffmpeg_progress_span = 100
+        self.ffmpeg_progress_span = 75 if self.audio_only_wav else 100
         self.ffmpeg_progress_duration = self.expected_duration
         self.ffmpeg_progress_label = "Download progress"
         self.log("Using Twitch VOD downloader backend.")
-
-        output_path = Path(self.output_path)
-        output_path.parent.mkdir(parents=True, exist_ok=True)
 
         command = [
             helper_path,
             "videodownload",
             "-u", self.url,
-            "-o", str(output_path),
+            "-o", str(destination),
             "-q", "best",
             "-b", format_seconds(self.start_seconds),
             "-e", format_seconds(self.end_seconds),
@@ -967,7 +1160,26 @@ class DownloadWorker(BaseWorker):
         output_path.parent.mkdir(parents=True, exist_ok=True)
 
         if self.start_seconds is None or self.end_seconds is None:
-            return self.run_twitch_clip_helper_download(helper_path, output_path)
+            if not self.audio_only_wav:
+                return self.run_twitch_clip_helper_download(helper_path, output_path)
+            temp_dir = user_data_dir() / "temp" / "twitch-clip"
+            temp_dir.mkdir(parents=True, exist_ok=True)
+            temp_clip = temp_dir / f"{output_path.stem}.source.mp4"
+            if temp_clip.exists():
+                temp_clip.unlink()
+            try:
+                code = self.run_twitch_clip_helper_download(helper_path, temp_clip, encode_metadata=False)
+                if code != 0:
+                    return code
+                if self.cancel_requested:
+                    raise KeyboardInterrupt
+                return self.extract_wav_from_media(temp_clip, output_path)
+            finally:
+                if temp_clip.exists():
+                    try:
+                        temp_clip.unlink()
+                    except OSError:
+                        pass
 
         temp_dir = user_data_dir() / "temp" / "twitch-clip"
         temp_dir.mkdir(parents=True, exist_ok=True)
@@ -981,6 +1193,9 @@ class DownloadWorker(BaseWorker):
                 return code
             if self.cancel_requested:
                 raise KeyboardInterrupt
+            if self.audio_only_wav:
+                trim_duration = self.end_seconds - self.start_seconds
+                return self.extract_wav_from_media(temp_clip, output_path, self.start_seconds, trim_duration)
             return self.trim_local_clip(temp_clip, output_path)
         finally:
             if temp_clip.exists():
@@ -1071,6 +1286,62 @@ class DownloadWorker(BaseWorker):
         finally:
             self.ffmpeg_process = None
 
+    def extract_wav_from_media(
+        self,
+        source_path: Path,
+        output_path: Path,
+        start_seconds: int | None = None,
+        duration_seconds: int | None = None,
+    ) -> int:
+        self.ffmpeg_progress_state = {}
+        self.last_progress_percent = -1
+        self.last_progress_log_time = 0.0
+        self.ffmpeg_progress_base = 75 if self.audio_only_wav else 0
+        self.ffmpeg_progress_span = 25 if self.audio_only_wav else 100
+        self.ffmpeg_progress_duration = duration_seconds or self.expected_duration
+        self.ffmpeg_progress_label = "Download progress"
+
+        command = [
+            self.ffmpeg_path,
+            "-y",
+            "-hide_banner",
+            "-loglevel", "error",
+        ]
+        if start_seconds is not None:
+            command.extend(["-ss", str(start_seconds)])
+        command.extend(["-i", str(source_path)])
+        if duration_seconds is not None:
+            command.extend(["-t", str(duration_seconds)])
+        command.extend([
+            "-vn",
+            "-progress", "pipe:2",
+            "-nostats",
+            "-acodec", "pcm_s16le",
+            str(output_path),
+        ])
+
+        process = subprocess.Popen(
+            command,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        self.ffmpeg_process = process
+        try:
+            assert process.stderr is not None
+            for raw_line in process.stderr:
+                if self.cancel_requested:
+                    raise KeyboardInterrupt
+                line = raw_line.strip()
+                if line:
+                    self.on_ffmpeg_output(line)
+            return process.wait()
+        finally:
+            self.ffmpeg_process = None
+
     def on_twitch_downloader_output(self, line: str) -> None:
         status_match = re.search(r"\[STATUS\] - (?P<label>.+?) (?P<percent>\d+)% \[(?P<step>\d+)/(?P<total>\d+)\]", line)
         if status_match:
@@ -1110,10 +1381,14 @@ class DownloadWorker(BaseWorker):
         stage_start = int(((step - 1) / total) * 100)
         stage_end = int((step / total) * 100)
         mapped = stage_start + round((stage_end - stage_start) * (percent / 100))
+        if self.audio_only_wav:
+            mapped = round(mapped * 0.75)
         return max(0, min(100, mapped))
 
     def map_clip_helper_progress(self, label: str, percent: int) -> int:
         normalized = label.lower()
+        if self.audio_only_wav:
+            return max(0, min(75, round(percent * 0.75)))
         if "downloading clip" in normalized:
             return max(0, min(75, round(percent * 0.75)))
         if "encoding clip metadata" in normalized:
@@ -1130,6 +1405,8 @@ class DownloadWorker(BaseWorker):
 
     def build_ffmpeg_output_args(self) -> list[str]:
         args = ["-progress", "pipe:2", "-nostats"]
+        if self.audio_only_wav:
+            return args
         if self.start_seconds is None or self.end_seconds is None or not self.use_hardware_acceleration:
             return args
 
@@ -1790,7 +2067,7 @@ class MainWindow(QMainWindow):
         self.setWindowFlags(Qt.WindowType.Window | Qt.WindowType.FramelessWindowHint)
         self.setWindowTitle(APP_TITLE)
         self.resize(1380, 900)
-        self.setMinimumSize(1220, 840)
+        self.setMinimumSize(1040, 720)
         self.apply_window_icon()
 
         self.dependencies_ready = False
@@ -1811,6 +2088,8 @@ class MainWindow(QMainWindow):
         self.user_settings = load_user_settings()
         self.cat_mode_enabled = bool(self.user_settings.get("cat_mode"))
         self.classic_ui_enabled = bool(self.user_settings.get("classic_ui"))
+        self.use_browser_cookies_enabled = bool(self.user_settings.get("use_browser_cookies"))
+        self.audio_only_wav_enabled = bool(self.user_settings.get("audio_only_wav"))
         self.last_fetched_url = ""
         self.last_output_path: Path | None = None
         self.log_file_path = self.initialize_log_file()
@@ -1819,6 +2098,7 @@ class MainWindow(QMainWindow):
         self._last_activity_phase: str | None = None
         self.activity_entries: list[str] = []
         self.layout_mode = "default"
+        self.ui_scale = 1.0
         self.root_widget: QWidget | None = None
         self.title_bar: WindowTitleBar | None = None
         self.kittycat_menu: QFrame | None = None
@@ -1837,8 +2117,8 @@ class MainWindow(QMainWindow):
         self.activity_timer = QTimer(self)
         self.activity_timer.setInterval(380)
         self.activity_timer.timeout.connect(self.tick_activity_indicator)
-        self.setFont(QFont("IBM Plex Sans", 11))
-        self.setStyleSheet(self.build_stylesheet(self.cat_mode_enabled, self.layout_mode, self.classic_ui_enabled))
+        self.setFont(QFont("IBM Plex Sans Var", 11))
+        self.setStyleSheet(self.build_stylesheet(self.cat_mode_enabled, self.layout_mode, self.classic_ui_enabled, self.ui_scale))
         self.build_ui()
         self.update_responsive_layout(force=True)
         self.enable_native_cursor()
@@ -1846,7 +2126,7 @@ class MainWindow(QMainWindow):
         self.update_button_state()
         self.refresh_update_button()
         self.append_log(f"App version: {APP_VERSION}")
-        self.append_log("Ready. Paste a video link, choose full video or enter a clip range, then download.")
+        self.append_log("Ready. Paste a video link, choose full range or enter a clip range, then download.")
         self.start_dependency_check()
 
     def build_ui(self) -> None:
@@ -2011,7 +2291,7 @@ class MainWindow(QMainWindow):
         self.clip_fields_layout.addWidget(self.start_field, 1)
         self.clip_fields_layout.addWidget(self.end_field, 1)
 
-        self.full_video_checkbox = IndustrialCheckBox("Download full video")
+        self.full_video_checkbox = IndustrialCheckBox("Download full range")
         self.full_video_checkbox.setObjectName("optionToggle")
         self.full_video_checkbox.toggled.connect(self.on_full_video_toggled)
         self.full_video_row = QWidget()
@@ -2020,6 +2300,19 @@ class MainWindow(QMainWindow):
         self.full_video_row_layout.setSpacing(0)
         self.full_video_row_layout.addWidget(self.full_video_checkbox)
         self.clip_card.content_layout.addWidget(self.full_video_row)
+
+        self.wav_checkbox = IndustrialCheckBox("Download as WAV")
+        self.wav_checkbox.setObjectName("optionToggle")
+        self.wav_checkbox.setChecked(self.audio_only_wav_enabled)
+        self.wav_checkbox.toggled.connect(lambda _: self.persist_user_settings())
+        self.clip_card.content_layout.addWidget(self.wav_checkbox)
+
+        self.cookies_checkbox = IndustrialCheckBox("Use browser cookies")
+        self.cookies_checkbox.setObjectName("optionToggle")
+        self.cookies_checkbox.setChecked(self.use_browser_cookies_enabled)
+        self.cookies_checkbox.setToolTip("Tries your default browser first, then other supported browsers if needed.")
+        self.cookies_checkbox.toggled.connect(lambda _: self.persist_user_settings())
+        self.clip_card.content_layout.addWidget(self.cookies_checkbox)
 
         self.reveal_checkbox = IndustrialCheckBox("Reveal in Explorer after download completes")
         self.reveal_checkbox.setObjectName("optionToggle")
@@ -2164,6 +2457,8 @@ class MainWindow(QMainWindow):
 
     def update_responsive_layout(self, force: bool = False) -> None:
         mode = "default"
+        scale = min(self.width() / 1380, self.height() / 900, 1.0)
+        scale = max(0.82, scale)
 
         stack_header = False
         stack_panels = False
@@ -2171,60 +2466,64 @@ class MainWindow(QMainWindow):
         stack_folder_controls = False
         stack_clip_fields = False
 
-        if force or mode != self.layout_mode:
+        if force or mode != self.layout_mode or abs(scale - self.ui_scale) >= 0.015:
             self.layout_mode = mode
-            self.setStyleSheet(self.build_stylesheet(self.cat_mode_enabled, self.layout_mode, self.classic_ui_enabled))
+            self.ui_scale = scale
+            self.setStyleSheet(self.build_stylesheet(self.cat_mode_enabled, self.layout_mode, self.classic_ui_enabled, self.ui_scale))
+
+        def sp(value: int) -> int:
+            return max(1, int(round(value * self.ui_scale)))
 
         if self.title_bar is not None:
-            title_bar_height = 56 if mode == "default" else 52
+            title_bar_height = sp(56 if mode == "default" else 52)
             self.title_bar.setFixedHeight(title_bar_height)
             self.title_bar.sync_window_controls()
 
         if self.classic_ui_enabled:
-            self.header_layout.setContentsMargins(20, 8, 20, 8)
+            self.header_layout.setContentsMargins(sp(20), sp(8), sp(20), sp(8))
         else:
-            self.header_layout.setContentsMargins(40, 24, 40, 18)
+            self.header_layout.setContentsMargins(sp(40), sp(24), sp(40), sp(18))
         self.header_top_layout.setDirection(QBoxLayout.Direction.TopToBottom if stack_header else QBoxLayout.Direction.LeftToRight)
-        self.header_top_layout.setSpacing(10 if self.classic_ui_enabled else (18 if stack_header else 22))
+        self.header_top_layout.setSpacing(sp(10 if self.classic_ui_enabled else (18 if stack_header else 22)))
         self.header_top_layout.setAlignment(self.header_action_panel, Qt.AlignmentFlag.AlignLeft if stack_header else Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignRight)
         self.header_action_layout.setDirection(QBoxLayout.Direction.LeftToRight)
-        self.header_action_layout.setSpacing(12 if self.classic_ui_enabled else 14)
+        self.header_action_layout.setSpacing(sp(12 if self.classic_ui_enabled else 14))
 
         self.main_content_layout.setDirection(QBoxLayout.Direction.LeftToRight)
         self.main_content_layout.setStretch(0, 8)
         self.main_content_layout.setStretch(1, 4)
-        self.right_panel.setMinimumWidth(380 if self.classic_ui_enabled else 420)
-        self.right_panel.setMaximumWidth(480 if self.classic_ui_enabled else 520)
+        self.right_panel.setMinimumWidth(sp(380 if self.classic_ui_enabled else 420))
+        self.right_panel.setMaximumWidth(sp(480 if self.classic_ui_enabled else 520))
         if self.right_panel.property("stacked") != stack_panels:
             self.right_panel.setProperty("stacked", stack_panels)
             self.right_panel.style().unpolish(self.right_panel)
             self.right_panel.style().polish(self.right_panel)
 
         if self.classic_ui_enabled:
-            self.left_column.setContentsMargins(20, 20, 12, 20)
-            self.left_column.setSpacing(16)
-            self.activity_header_layout.setContentsMargins(22, 18, 22, 10)
-            self.activity_body_layout.setContentsMargins(22, 8, 22, 12)
-            self.download_section_layout.setContentsMargins(22, 12, 22, 22)
+            self.left_column.setContentsMargins(sp(20), sp(20), sp(12), sp(20))
+            self.left_column.setSpacing(sp(16))
+            self.activity_header_layout.setContentsMargins(sp(22), sp(18), sp(22), sp(10))
+            self.activity_body_layout.setContentsMargins(sp(22), sp(8), sp(22), sp(12))
+            self.download_section_layout.setContentsMargins(sp(22), sp(12), sp(22), sp(22))
         else:
-            self.left_column.setContentsMargins(20, 10, 16, 16)
-            self.left_column.setSpacing(14)
-            self.activity_header_layout.setContentsMargins(28, 18, 28, 14)
-            self.activity_body_layout.setContentsMargins(28, 22, 28, 20)
-            self.download_section_layout.setContentsMargins(28, 22, 28, 24)
+            self.left_column.setContentsMargins(sp(20), sp(10), sp(16), sp(16))
+            self.left_column.setSpacing(sp(14))
+            self.activity_header_layout.setContentsMargins(sp(28), sp(18), sp(28), sp(14))
+            self.activity_body_layout.setContentsMargins(sp(28), sp(22), sp(28), sp(20))
+            self.download_section_layout.setContentsMargins(sp(28), sp(22), sp(28), sp(24))
 
         self.video_url_row_layout.setDirection(QBoxLayout.Direction.LeftToRight)
-        self.video_url_row_layout.setSpacing(22)
+        self.video_url_row_layout.setSpacing(sp(22))
         self.save_folder_row_layout.setDirection(QBoxLayout.Direction.LeftToRight)
-        self.save_folder_row_layout.setSpacing(22)
+        self.save_folder_row_layout.setSpacing(sp(22))
         self.filename_row_layout.setDirection(QBoxLayout.Direction.LeftToRight)
-        self.filename_row_layout.setSpacing(22)
+        self.filename_row_layout.setSpacing(sp(22))
         self.save_folder_input_layout.setDirection(QBoxLayout.Direction.LeftToRight)
-        self.save_folder_input_layout.setSpacing(16)
+        self.save_folder_input_layout.setSpacing(sp(16))
         self.clip_fields_layout.setDirection(QBoxLayout.Direction.LeftToRight)
-        self.clip_fields_layout.setSpacing(18)
+        self.clip_fields_layout.setSpacing(sp(18))
 
-        label_width = 126
+        label_width = sp(126)
         for label in (self.video_url_label, self.save_folder_label, self.filename_label):
             self.set_field_label_width(label, label_width)
         for row_layout, label in (
@@ -2234,10 +2533,14 @@ class MainWindow(QMainWindow):
         ):
             row_layout.setAlignment(label, Qt.AlignmentFlag.AlignVCenter)
 
-        self.browse_button.setMinimumHeight(54)
-        self.browse_button.setMaximumHeight(54)
-        self.browse_button.setMinimumWidth(124)
-        self.download_button.setMinimumHeight(72)
+        field_height = sp(54)
+        self.video_meta.setMinimumHeight(sp(52))
+        self.activity_indicator.setFixedSize(sp(10), sp(10))
+        for widget in (self.url_input, self.output_dir_input, self.filename_input, self.start_input, self.end_input, self.browse_button):
+            widget.setMinimumHeight(field_height)
+            widget.setMaximumHeight(field_height)
+        self.browse_button.setMinimumWidth(sp(124))
+        self.download_button.setMinimumHeight(sp(72))
 
     def enable_native_cursor(self) -> None:
         self.unsetCursor()
@@ -2380,7 +2683,18 @@ class MainWindow(QMainWindow):
                     app.setWindowIcon(icon)
                 return
 
-    def build_stylesheet(self, cat_mode: bool = False, layout_mode: str = "default", classic_ui: bool = False) -> str:
+    def build_stylesheet(
+        self,
+        cat_mode: bool = False,
+        layout_mode: str = "default",
+        classic_ui: bool = False,
+        scale: float = 1.0,
+    ) -> str:
+        def sp(value: int) -> int:
+            return max(1, int(round(value * scale)))
+        body_font_family = "\"IBM Plex Sans Var\", \"IBM Plex Sans\""
+        mono_font_family = "\"IBM Plex Mono\", \"DM Mono\""
+
         main_background = "#090909"
         window_background = "#0d0d0d"
         card_border = "#1e1e1e"
@@ -2395,23 +2709,23 @@ class MainWindow(QMainWindow):
         dim_text = "#4a4a4a"
         accent = "#c0ff33"
         accent_soft = "rgba(192, 255, 51, 0.10)"
-        title_bar_icon_size = 22
-        title_bar_brand_size = 12
-        title_bar_title_size = 13
-        hero_title_size = 50
-        eyebrow_size = 11
-        eyebrow_accent_size = 13
-        version_size = 11
-        version_button_size = 11
-        card_title_size = 22
-        field_label_size = 11
-        body_text_size = 13
-        input_text_size = 14
-        time_input_size = 14
-        activity_title_size = 19
-        log_text_size = 14
-        activity_cursor_size = 18
-        checkbox_size = 13
+        title_bar_icon_size = sp(22)
+        title_bar_brand_size = sp(12)
+        title_bar_title_size = sp(13)
+        hero_title_size = sp(50)
+        eyebrow_size = sp(11)
+        eyebrow_accent_size = sp(13)
+        version_size = sp(11)
+        version_button_size = sp(11)
+        card_title_size = sp(22)
+        field_label_size = sp(11)
+        body_text_size = sp(13)
+        input_text_size = sp(14)
+        time_input_size = sp(14)
+        activity_title_size = sp(19)
+        log_text_size = sp(14)
+        activity_cursor_size = sp(18)
+        checkbox_size = sp(13)
 
         if classic_ui:
             main_background = "#131516"
@@ -2428,50 +2742,19 @@ class MainWindow(QMainWindow):
             text_color = "#efe8dd"
             muted_text = "#cbbda8"
             dim_text = "#7d766d"
-            title_bar_brand_size = 11
-            title_bar_title_size = 12
-            hero_title_size = 32
-            version_size = 12
-            version_button_size = 12
-            card_title_size = 20
-            field_label_size = 12
-            body_text_size = 12
-            input_text_size = 14
-            time_input_size = 13
-            activity_title_size = 18
-            log_text_size = 13
-            checkbox_size = 14
-        elif layout_mode == "wide":
-            title_bar_icon_size = 24
-            title_bar_brand_size = 13
-            title_bar_title_size = 14
-            hero_title_size = 62
-            card_title_size = 24
-            body_text_size = 14
-            input_text_size = 15
-            time_input_size = 15
-            activity_title_size = 22
-            log_text_size = 15
-            activity_cursor_size = 20
-            checkbox_size = 14
-        elif layout_mode == "compact":
-            title_bar_icon_size = 22
-            title_bar_brand_size = 11
-            title_bar_title_size = 12
-            hero_title_size = 48
-            eyebrow_size = 10
-            eyebrow_accent_size = 12
-            version_size = 10
-            version_button_size = 10
-            card_title_size = 18
-            field_label_size = 10
-            body_text_size = 12
-            input_text_size = 13
-            time_input_size = 13
-            activity_title_size = 18
-            log_text_size = 13
-            activity_cursor_size = 16
-            checkbox_size = 12
+            title_bar_brand_size = sp(11)
+            title_bar_title_size = sp(12)
+            hero_title_size = sp(32)
+            version_size = sp(12)
+            version_button_size = sp(12)
+            card_title_size = sp(20)
+            field_label_size = sp(12)
+            body_text_size = sp(12)
+            input_text_size = sp(14)
+            time_input_size = sp(13)
+            activity_title_size = sp(18)
+            log_text_size = sp(13)
+            checkbox_size = sp(14)
 
         return f"""
         QWidget#appRoot {{
@@ -2491,13 +2774,13 @@ class MainWindow(QMainWindow):
             border-bottom: {"none" if classic_ui else "1px solid #1e1e1e"};
         }}
         QPushButton#titleBarToggle {{
-            font-family: "DM Mono";
+            font-family: {mono_font_family};
             background: transparent;
             color: {accent};
             font-size: {title_bar_icon_size}px;
             padding: 0px;
-            min-width: 22px;
-            min-height: 22px;
+            min-width: {sp(22)}px;
+            min-height: {sp(22)}px;
             border: none;
             letter-spacing: 0;
         }}
@@ -2507,7 +2790,7 @@ class MainWindow(QMainWindow):
             border: none;
         }}
         QLabel#titleBarBrand {{
-            font-family: {"\"DM Mono\"" if not classic_ui else "\"Segoe UI\""};
+            font-family: {(mono_font_family if not classic_ui else "\"Segoe UI\"")};
             color: {dim_text};
             font-size: {title_bar_brand_size}px;
             letter-spacing: {("0.24em" if not classic_ui else "0.08em")};
@@ -2517,27 +2800,27 @@ class MainWindow(QMainWindow):
             border: none;
         }}
         QLabel#titleBarTitle {{
-            font-family: {"\"IBM Plex Sans\"" if not classic_ui else "\"Segoe UI\""};
+            font-family: {(body_font_family if not classic_ui else "\"Segoe UI\"")};
             color: {text_color};
             font-size: {title_bar_title_size}px;
             font-weight: {500 if not classic_ui else 500};
             letter-spacing: {("0.04em" if not classic_ui else "0.04em")};
         }}
         QPushButton#titleBarButton, QPushButton#titleBarCloseButton {{
-            font-family: "DM Mono";
+            font-family: {mono_font_family};
             background: transparent;
             color: {muted_text};
             border: none;
-            min-width: 52px;
-            min-height: 52px;
+            min-width: {sp(52)}px;
+            min-height: {sp(52)}px;
             padding: 0px;
-            font-size: 18px;
+            font-size: {sp(18)}px;
             letter-spacing: 0;
             text-transform: none;
             border-radius: 0px;
         }}
         QPushButton#titleBarCloseButton {{
-            font-size: 24px;
+            font-size: {sp(24)}px;
         }}
         QPushButton#titleBarButton:hover {{
             background: {"transparent" if classic_ui else "#161616"};
@@ -2554,14 +2837,14 @@ class MainWindow(QMainWindow):
         QFrame#kittycatMenu {{
             background: {"#1b1f23" if classic_ui else "#111111"};
             border: 1px solid {"#2a2e33" if classic_ui else "#1e1e1e"};
-            border-radius: {"12px" if classic_ui else "0px"};
+            border-radius: {sp(12) if classic_ui else 0}px;
         }}
         QFrame#activityDivider {{
             background: {"#2a2e33" if classic_ui else "#1e1e1e"};
             border: none;
         }}
         QLabel#kittycatMenuTitle {{
-            font-family: {"\"Segoe UI\"" if classic_ui else "\"DM Mono\""};
+            font-family: {"\"Segoe UI\"" if classic_ui else mono_font_family};
             color: {muted_text};
             font-size: 11px;
             letter-spacing: {("0em" if classic_ui else "0.22em")};
@@ -2570,7 +2853,7 @@ class MainWindow(QMainWindow):
         QFrame#card {{
             background: {card_background};
             border: 1px solid {card_border};
-            border-radius: {20 if classic_ui else 0}px;
+            border-radius: {sp(20) if classic_ui else 0}px;
         }}
         QFrame#cardAccentLine {{
             background: {"transparent" if classic_ui else "transparent"};
@@ -2584,7 +2867,7 @@ class MainWindow(QMainWindow):
         }}
         QLabel#eyebrow {{
             color: {muted_text};
-            font-family: {"\"DM Mono\"" if not classic_ui else "\"Segoe UI\""};
+            font-family: {(mono_font_family if not classic_ui else "\"Segoe UI\"")};
             font-size: {eyebrow_size}px;
             font-weight: 600;
             letter-spacing: {("0.30em" if not classic_ui else "0.08em")};
@@ -2592,7 +2875,7 @@ class MainWindow(QMainWindow):
         }}
         QLabel#eyebrowAccent {{
             color: {"transparent" if classic_ui else accent};
-            font-family: "DM Mono";
+            font-family: {mono_font_family};
             font-size: {eyebrow_accent_size}px;
             font-weight: 500;
             letter-spacing: 0.22em;
@@ -2604,7 +2887,7 @@ class MainWindow(QMainWindow):
             letter-spacing: {("-0.02em" if not classic_ui else "0em")};
         }}
         QLabel#versionPill {{
-            font-family: {"\"Segoe UI\"" if classic_ui else "\"DM Mono\""};
+            font-family: {"\"Segoe UI\"" if classic_ui else mono_font_family};
             color: {dim_text};
             font-size: {version_size}px;
             font-weight: {700 if classic_ui else 500};
@@ -2613,14 +2896,14 @@ class MainWindow(QMainWindow):
             text-transform: {("none" if classic_ui else "uppercase")};
         }}
         QPushButton#versionPillButton {{
-            font-family: {"\"IBM Plex Sans\"" if not classic_ui else "\"Segoe UI\""};
+            font-family: {(body_font_family if not classic_ui else "\"Segoe UI\"")};
             background: transparent;
             color: {muted_text};
             font-size: {version_button_size}px;
             font-weight: {500 if not classic_ui else 700};
             letter-spacing: {("0.12em" if not classic_ui else "0em")};
             text-transform: {("uppercase" if not classic_ui else "none")};
-            padding: {("10px 18px" if not classic_ui else "0px")};
+            padding: {("0px" if classic_ui else f"{sp(10)}px {sp(18)}px")};
             border: {("1px solid #2e2e2e" if not classic_ui else "none")};
             border-radius: {0 if not classic_ui else 0}px;
         }}
@@ -2635,14 +2918,14 @@ class MainWindow(QMainWindow):
             border-color: {("#1e1e1e" if not classic_ui else "transparent")};
         }}
         QLabel#hintText, QLabel#metaText {{
-            font-family: {"\"Segoe UI\"" if classic_ui else "\"IBM Plex Sans\""};
+            font-family: {(body_font_family if not classic_ui else "\"Segoe UI\"")};
             color: {muted_text};
             line-height: {("1.4" if classic_ui else "1.7")};
             font-size: {body_text_size}px;
             letter-spacing: {("0em" if classic_ui else "0.01em")};
         }}
         QCheckBox#optionToggle {{
-            font-family: {"\"Segoe UI\"" if classic_ui else "\"IBM Plex Sans\""};
+            font-family: {(body_font_family if not classic_ui else "\"Segoe UI\"")};
             color: {text_color};
             spacing: 12px;
             font-size: {checkbox_size}px;
@@ -2655,9 +2938,9 @@ class MainWindow(QMainWindow):
             color: {text_color};
         }}
         QCheckBox#optionToggle::indicator {{
-            width: {18 if classic_ui else 14}px;
-            height: {18 if classic_ui else 14}px;
-            border-radius: {5 if classic_ui else 0}px;
+            width: {sp(18 if classic_ui else 14)}px;
+            height: {sp(18 if classic_ui else 14)}px;
+            border-radius: {sp(5) if classic_ui else 0}px;
             border: 1px solid {"#3a4148" if classic_ui else "#333333"};
             background: {"#171a1d" if classic_ui else "#090909"};
         }}
@@ -2673,14 +2956,14 @@ class MainWindow(QMainWindow):
             letter-spacing: {("0em" if classic_ui else "-0.01em")};
         }}
         QLabel#fieldLabel {{
-            font-family: {"\"DM Mono\"" if not classic_ui else "\"Segoe UI\""};
+            font-family: {(mono_font_family if not classic_ui else "\"Segoe UI\"")};
             color: {muted_text};
             font-size: {field_label_size}px;
             font-weight: 600;
             letter-spacing: {("0.24em" if not classic_ui else "0.04em")};
         }}
         QLineEdit, QTextEdit {{
-            font-family: {"\"IBM Plex Sans\"" if not classic_ui else "\"Segoe UI\""};
+            font-family: {(body_font_family if not classic_ui else "\"Segoe UI\"")};
             background: {input_background};
             border: 1px solid #242424;
             border-radius: {12 if classic_ui else 0}px;
@@ -2697,13 +2980,13 @@ class MainWindow(QMainWindow):
         QLineEdit#primaryInput {{
             font-size: {input_text_size}px;
             font-weight: {400 if not classic_ui else 600};
-            min-height: {46 if not classic_ui else 38}px;
+            min-height: {sp(46 if not classic_ui else 38)}px;
             background: {primary_input_background};
             border: 1px solid {primary_input_border};
             letter-spacing: {("0.02em" if not classic_ui else "0em")};
         }}
         QLineEdit#timeInput {{
-            min-height: {46 if not classic_ui else 36}px;
+            min-height: {sp(46 if not classic_ui else 36)}px;
             font-size: {time_input_size}px;
             letter-spacing: {("0.02em" if not classic_ui else "0em")};
         }}
@@ -2716,7 +2999,7 @@ class MainWindow(QMainWindow):
             border: 1px solid {accent};
         }}
         QPushButton {{
-            font-family: {"\"IBM Plex Sans\"" if not classic_ui else "\"Segoe UI\""};
+            font-family: {(body_font_family if not classic_ui else "\"Segoe UI\"")};
             background: {button_background};
             color: {text_color if classic_ui else muted_text};
             border: 1px solid #2e2e2e;
@@ -2737,9 +3020,9 @@ class MainWindow(QMainWindow):
             border-color: #22262a;
         }}
         QPushButton#accentButton {{
-            font-size: {12 if not classic_ui else 14}px;
+            font-size: {sp(12 if not classic_ui else 14)}px;
             font-weight: 700;
-            padding: {("18px 18px" if not classic_ui else "13px 18px")};
+            padding: {f"{sp(18)}px {sp(18)}px" if not classic_ui else f"{sp(13)}px {sp(18)}px"};
             background: {accent_soft if not classic_ui else button_background};
             color: {accent if not classic_ui else text_color};
             border: 1px solid {accent if not classic_ui else card_border};
@@ -2767,7 +3050,7 @@ class MainWindow(QMainWindow):
         }}
         QFrame#activityIndicator {{
             background: {"transparent" if classic_ui else accent};
-            border-radius: 5px;
+            border-radius: {sp(5)}px;
         }}
         QLabel#activityTitle {{
             font-family: {"\"Trebuchet MS\"" if classic_ui else "\"Syne\""};
@@ -2776,11 +3059,11 @@ class MainWindow(QMainWindow):
             font-weight: {700 if classic_ui else 700};
         }}
         QPushButton#activityClearButton {{
-            font-family: {"\"Segoe UI\"" if classic_ui else "\"IBM Plex Sans\""};
+            font-family: {(body_font_family if not classic_ui else "\"Segoe UI\"")};
             background: transparent;
             border: none;
             color: {dim_text};
-            font-size: 10px;
+            font-size: {sp(10)}px;
             letter-spacing: {("0em" if classic_ui else "0.12em")};
             text-transform: {("none" if classic_ui else "uppercase")};
             padding: 0px;
@@ -2791,7 +3074,7 @@ class MainWindow(QMainWindow):
             border: none;
         }}
         QTextEdit#logOutput {{
-            font-family: {"\"Consolas\"" if classic_ui else "\"DM Mono\""};
+            font-family: {"\"Consolas\"" if classic_ui else mono_font_family};
             background: {"transparent" if classic_ui else "#090909"};
             border: none;
             color: {muted_text};
@@ -2799,7 +3082,7 @@ class MainWindow(QMainWindow):
             padding: 0px;
         }}
         QLabel#activityCursor {{
-            font-family: "DM Mono";
+            font-family: {mono_font_family};
             color: {accent};
             font-size: {activity_cursor_size}px;
         }}
@@ -2811,7 +3094,7 @@ class MainWindow(QMainWindow):
 
     def on_classic_ui_toggled(self, checked: bool) -> None:
         self.classic_ui_enabled = checked
-        self.setStyleSheet(self.build_stylesheet(self.cat_mode_enabled, self.layout_mode, self.classic_ui_enabled))
+        self.setStyleSheet(self.build_stylesheet(self.cat_mode_enabled, self.layout_mode, self.classic_ui_enabled, self.ui_scale))
         self.update_responsive_layout(force=True)
         self.persist_user_settings()
         self.position_kittycat_menu()
@@ -3331,7 +3614,7 @@ class MainWindow(QMainWindow):
             color = "#c0ff33"
             weight = "500"
         return (
-            f"<div style=\"font-family:'DM Mono'; font-size:13px; letter-spacing:0.04em; "
+            f"<div style=\"font-family:'IBM Plex Mono','DM Mono'; font-size:13px; letter-spacing:0.04em; "
             f"line-height:1.9; color:{color}; font-weight:{weight};\">{text}</div>"
         )
 
@@ -3421,7 +3704,7 @@ class MainWindow(QMainWindow):
         self.set_status("Fetching video info...")
         self.update_button_state()
         self.append_log("Starting metadata lookup...")
-        worker = InfoWorker(url)
+        worker = InfoWorker(url, use_browser_cookies=self.cookies_checkbox.isChecked())
         self.run_worker(
             worker,
             self.on_info_loaded,
@@ -3452,8 +3735,10 @@ class MainWindow(QMainWindow):
                 f"{error}"
             )
             return
+        audio_only_wav = self.wav_checkbox.isChecked()
+        use_browser_cookies = self.cookies_checkbox.isChecked()
         self.persist_user_settings()
-        target_output_path = self.resolve_output_path(output_dir)
+        target_output_path = self.resolve_output_path(output_dir, audio_only_wav=audio_only_wav)
         if target_output_path.exists():
             answer = QMessageBox.question(
                 self,
@@ -3486,7 +3771,7 @@ class MainWindow(QMainWindow):
         end_seconds: int | None = None
         if not self.full_video_checkbox.isChecked():
             if not start_text or not end_text:
-                self.show_error('Enter both start and end times, or enable "Download full video".')
+                self.show_error('Enter both start and end times, or enable "Download full range".')
                 return
 
             try:
@@ -3507,7 +3792,7 @@ class MainWindow(QMainWindow):
             section_value = f"*{format_seconds(start_seconds)}-{format_seconds(end_seconds)}"
             expected_duration = end_seconds - start_seconds
         else:
-            self.append_log("Full video mode enabled.")
+            self.append_log("Full range mode enabled.")
 
         self.is_downloading = True
         self.set_progress(0)
@@ -3516,13 +3801,15 @@ class MainWindow(QMainWindow):
         self.append_log("Starting download worker...")
         worker = DownloadWorker(
             url=url,
-            output_template=self.build_output_template(output_dir),
+            output_template=self.build_output_template(output_dir, audio_only_wav=audio_only_wav),
             output_path=str(target_output_path),
             ffmpeg_path=ffmpeg_path,
             expected_duration=expected_duration,
             start_seconds=start_seconds,
             end_seconds=end_seconds,
             use_hardware_acceleration=True,
+            use_browser_cookies=use_browser_cookies,
+            audio_only_wav=audio_only_wav,
         )
         self.run_worker(
             worker,
@@ -3678,6 +3965,8 @@ class MainWindow(QMainWindow):
             "output_dir": self.output_dir_input.text().strip() or str(DEFAULT_OUTPUT_DIR),
             "cat_mode": self.cat_mode_enabled,
             "classic_ui": self.classic_ui_enabled,
+            "use_browser_cookies": self.cookies_checkbox.isChecked() if hasattr(self, "cookies_checkbox") else self.use_browser_cookies_enabled,
+            "audio_only_wav": self.wav_checkbox.isChecked() if hasattr(self, "wav_checkbox") else self.audio_only_wav_enabled,
         })
 
     def cleanup_cancelled_download(self) -> None:
@@ -3688,7 +3977,10 @@ class MainWindow(QMainWindow):
             candidates.extend([
                 target_path,
                 target_path.with_suffix(".mp4.part"),
+                target_path.with_suffix(".wav.part"),
                 target_path.with_suffix(".part"),
+                target_path.with_suffix(".m4a.part"),
+                target_path.with_suffix(".webm.part"),
                 target_path.with_suffix(".f140.mp4"),
                 target_path.with_suffix(".f251.webm"),
             ])
@@ -3818,7 +4110,7 @@ class MainWindow(QMainWindow):
     def start_dependency_check(self) -> None:
         self.append_log("Looking for yt-dlp and ffmpeg...")
         existing_ffmpeg = self.resolve_ffmpeg_executable()
-        if self.python_has_yt_dlp() and existing_ffmpeg:
+        if self.is_frozen() and self.python_has_yt_dlp() and existing_ffmpeg:
             self.ffmpeg_path = existing_ffmpeg
             self.dependencies_ready = True
             self.set_status("Ready")
@@ -3827,6 +4119,9 @@ class MainWindow(QMainWindow):
             self.fetch_info_if_ready()
             self.queue_startup_update_check()
             return
+
+        if not self.is_frozen():
+            self.append_log("Checking for the latest yt-dlp and ffmpeg packages...")
 
         self.update_button_state()
         worker = DependencyWorker()
@@ -3924,22 +4219,27 @@ class MainWindow(QMainWindow):
             return self.ffmpeg_path
         return DependencyWorker().resolve_ffmpeg_executable()
 
-    def build_output_template(self, output_dir: Path) -> str:
+    def build_output_template(self, output_dir: Path, audio_only_wav: bool = False) -> str:
         requested_name = self.filename_input.text().strip()
         if requested_name:
-            safe_name = self.sanitize_filename(requested_name)
+            safe_name = self.normalize_output_stem(requested_name)
             return str(output_dir / f"{safe_name}.%(ext)s")
         return str(output_dir / "%(title)s.%(ext)s")
 
-    def resolve_output_path(self, output_dir: Path) -> Path:
+    def resolve_output_path(self, output_dir: Path, audio_only_wav: bool = False) -> Path:
         requested_name = self.filename_input.text().strip()
         if requested_name:
-            filename = self.sanitize_filename(requested_name)
+            filename = self.normalize_output_stem(requested_name)
         elif self.video_title:
             filename = self.sanitize_filename(self.video_title)
         else:
             filename = "download"
-        return output_dir / f"{filename}.mp4"
+        extension = "wav" if audio_only_wav else "mp4"
+        return output_dir / f"{filename}.{extension}"
+
+    def normalize_output_stem(self, value: str) -> str:
+        stem = self.sanitize_filename(value)
+        return re.sub(r"\.(mp4|wav|mp3|m4a|webm|mov|mkv)$", "", stem, flags=re.IGNORECASE) or "clip"
 
     def sanitize_filename(self, value: str) -> str:
         invalid_chars = '<>:"/\\|?*'
@@ -3953,6 +4253,7 @@ class MainWindow(QMainWindow):
 def main() -> None:
     configure_ssl_environment()
     app = QApplication(sys.argv)
+    load_application_fonts()
     window = MainWindow()
     window.show()
     sys.exit(app.exec())

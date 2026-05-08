@@ -29,7 +29,7 @@ if ($LASTEXITCODE -ne 0) {
     throw "pip upgrade failed with exit code $LASTEXITCODE"
 }
 
-& $PythonExe -m pip install --user -r (Join-Path $ProjectRoot "build_requirements.txt")
+& $PythonExe -m pip install --user --upgrade -r (Join-Path $ProjectRoot "build_requirements.txt")
 if ($LASTEXITCODE -ne 0) {
     throw "Installing build requirements failed with exit code $LASTEXITCODE"
 }
