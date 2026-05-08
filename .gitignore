@@ -16,6 +16,7 @@ dist-fresh/
 node.exe
 tools/bgutil-ytdlp-pot-provider/server/node_modules/
 tools/bgutil-ytdlp-pot-provider/server/.cache/
+.cache/
 tools/tdcli-clip-full.mp4
 tools/tdcli-clip-trim.mp4
 tools/tdcli-current-test.mp4

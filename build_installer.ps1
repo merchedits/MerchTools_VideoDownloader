@@ -11,7 +11,16 @@ $AppName = [string]$AppMetadata.title
 $AppVersion = [string]$AppMetadata.version
 $AppPublisher = [string]$AppMetadata.publisher
 $AppExeName = "$AppName.exe"
-$AppSourceDir = "dist\$AppName"
+$FreshVersionedSourceDir = Join-Path $ProjectRoot "dist-fresh\$AppVersion\$AppName"
+$FreshSourceDir = Join-Path $ProjectRoot "dist-fresh\$AppName"
+$DefaultSourceDir = Join-Path $ProjectRoot "dist\$AppName"
+$AppSourceDir = if (Test-Path $FreshVersionedSourceDir) {
+    "dist-fresh\$AppVersion\$AppName"
+} elseif (Test-Path $FreshSourceDir) {
+    "dist-fresh\$AppName"
+} else {
+    "dist\$AppName"
+}
 $LatestJsonPath = Join-Path $ProjectRoot "latest.json"
 $PossiblePaths = @(
     (Get-Command iscc -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Source -ErrorAction SilentlyContinue),

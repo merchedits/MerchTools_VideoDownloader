@@ -11,8 +11,10 @@ $AppMetadata = $MetadataJson | ConvertFrom-Json
 $AppName = [string]$AppMetadata.title
 $AppVersion = [string]$AppMetadata.version
 $SpecPath = Join-Path $ProjectRoot "$AppName.spec"
-$DistDir = Join-Path $ProjectRoot "dist\$AppName"
-$BuildDir = Join-Path $ProjectRoot "build"
+$DistRoot = Join-Path $ProjectRoot ("dist-fresh\" + $AppVersion)
+$BuildRoot = Join-Path $ProjectRoot ("build-fresh\" + $AppVersion)
+$DistDir = Join-Path $DistRoot $AppName
+$BuildDir = $BuildRoot
 $BuildTempDir = Join-Path $env:USERPROFILE "MerchToolsBuildTemp"
 $FfmpegSource = $env:YTCUTTER_FFMPEG_PATH
 $FfmpegTarget = Join-Path $ProjectRoot "ffmpeg.exe"
@@ -121,8 +123,8 @@ if (Test-Path $BuildDir) {
     Remove-Item $BuildDir -Recurse -Force
 }
 
-if (Test-Path $DistDir) {
-    Remove-Item $DistDir -Recurse -Force
+if (Test-Path $DistRoot) {
+    Remove-Item $DistRoot -Recurse -Force
 }
 
 if (-not (Test-Path $SpecPath)) {
@@ -132,10 +134,10 @@ if (-not (Test-Path $SpecPath)) {
 try {
     $PyInstallerCheck = & $PythonExe -c "import PyInstaller; print(PyInstaller.__version__)" 2>$null
     if ($LASTEXITCODE -eq 0 -and $PyInstallerCheck) {
-        & $PythonExe -m PyInstaller --noconfirm --clean $SpecPath
+        & $PythonExe -m PyInstaller --noconfirm --clean --distpath $DistRoot --workpath $BuildRoot $SpecPath
     }
     elseif (Test-Path $PyInstallerScript) {
-        & $PyInstallerScript --noconfirm --clean $SpecPath
+        & $PyInstallerScript --noconfirm --clean --distpath $DistRoot --workpath $BuildRoot $SpecPath
     }
     else {
         throw "PyInstaller is installed but could not be invoked through python -m or the user Scripts path."

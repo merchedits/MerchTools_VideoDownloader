@@ -84,6 +84,8 @@ REQUIRED_PYTHON_PACKAGES = [
     ("yt_dlp_plugins.extractor.getpot_bgutil_script", "bgutil-ytdlp-pot-provider"),
 ]
 HARDWARE_ENCODER_CACHE: dict[str, str | None] = {}
+PO_TOKEN_PROVIDER_IMPORT_ERROR: Exception | None = None
+PO_TOKEN_PROVIDER_READY: bool | None = None
 
 IS_WINDOWS = sys.platform.startswith("win")
 WM_SYSCOMMAND = 0x0112
@@ -313,6 +315,34 @@ def resolve_bgutil_provider_server_home() -> str | None:
     return None
 
 
+def ensure_po_token_provider_ready() -> bool:
+    global PO_TOKEN_PROVIDER_IMPORT_ERROR, PO_TOKEN_PROVIDER_READY
+    if PO_TOKEN_PROVIDER_READY is not None:
+        return PO_TOKEN_PROVIDER_READY
+
+    if not getattr(sys, "frozen", False):
+        PO_TOKEN_PROVIDER_IMPORT_ERROR = None
+        PO_TOKEN_PROVIDER_READY = True
+        return True
+
+    provider_modules = (
+        "yt_dlp_plugins.extractor.getpot_bgutil",
+        "yt_dlp_plugins.extractor.getpot_bgutil_http",
+        "yt_dlp_plugins.extractor.getpot_bgutil_script",
+    )
+    try:
+        for module_name in provider_modules:
+            importlib.import_module(module_name)
+    except Exception as exc:
+        PO_TOKEN_PROVIDER_IMPORT_ERROR = exc
+        PO_TOKEN_PROVIDER_READY = False
+        return False
+
+    PO_TOKEN_PROVIDER_IMPORT_ERROR = None
+    PO_TOKEN_PROVIDER_READY = True
+    return True
+
+
 def configure_po_token_environment() -> None:
     candidates = [
         user_data_dir() / "cache",
@@ -333,12 +363,13 @@ def yt_dlp_js_runtime_options() -> dict:
     if not node_path:
         return {}
     provider_home = resolve_bgutil_provider_server_home()
+    provider_ready = bool(provider_home) and ensure_po_token_provider_ready()
     extractor_args: dict[str, dict[str, list[str]]] = {
         "youtube": {
-            "player_client": ["mweb", "android_vr"] if provider_home else ["web", "android_vr"],
+            "player_client": ["mweb", "android_vr"] if provider_ready else ["web", "android_vr"],
         }
     }
-    if provider_home:
+    if provider_ready:
         configure_po_token_environment()
         extractor_args["youtubepot-bgutilscript"] = {"server_home": [provider_home]}
     return {
